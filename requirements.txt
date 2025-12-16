@@ -1,0 +1,23 @@
+# Binance Futures Trading Bot Dependencies
+# Python 3.11+ required
+
+# Core dependencies
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+requests>=2.31.0
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Sentiment analysis
+vaderSentiment>=3.3.2
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Optional: For transformer-based sentiment (large download)
+# transformers>=4.30.0
+# torch>=2.0.0
+
+# Development
+python-dotenv>=1.0.0
