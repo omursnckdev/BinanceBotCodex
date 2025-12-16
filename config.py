@@ -1,6 +1,8 @@
 """
 Configuration module with Pydantic settings and safety toggles.
 Testnet-first design with multiple safety layers for live trading.
+
+v3: Aggressive scalping with trailing stops, RSI extreme, whale entry signals.
 """
 
 from __future__ import annotations
@@ -56,6 +58,13 @@ class Trend(str, Enum):
     NEUTRAL = "neutral"
 
 
+class RSIExtremeDirection(str, Enum):
+    """RSI extreme direction."""
+    OVERSOLD = "oversold"
+    OVERBOUGHT = "overbought"
+    NONE = "none"
+
+
 class SymbolConfig(BaseModel):
     """Per-symbol configuration."""
     symbol: str
@@ -64,20 +73,20 @@ class SymbolConfig(BaseModel):
     margin_type: MarginType = MarginType.ISOLATED
 
     # Position sizing
-    max_position_size_usd: float = Field(default=1000.0, gt=0)
+    max_position_size_usd: float = Field(default=2500.0, gt=0)
     risk_per_trade_pct: float = Field(default=1.0, ge=0.1, le=5.0)
 
-    # Scalping parameters
-    take_profit_pct: float = Field(default=1.2, ge=0.5, le=5.0)
-    stop_loss_pct: float = Field(default=0.6, ge=0.2, le=3.0)
+    # Aggressive scalping parameters (v3)
+    take_profit_pct: float = Field(default=0.8, ge=0.3, le=3.0)
+    stop_loss_pct: float = Field(default=0.4, ge=0.15, le=2.0)
 
-    # Signal weights for fusion
-    tech_weight: float = Field(default=0.5, ge=0, le=1)
-    whale_weight: float = Field(default=0.3, ge=0, le=1)
-    sentiment_weight: float = Field(default=0.2, ge=0, le=1)
+    # Signal weights for fusion (v3 updated)
+    tech_weight: float = Field(default=0.45, ge=0, le=1)
+    whale_weight: float = Field(default=0.35, ge=0, le=1)
+    sentiment_weight: float = Field(default=0.20, ge=0, le=1)
 
-    # Cooldown after exit (seconds)
-    cooldown_seconds: int = Field(default=300, ge=0)
+    # Cooldown after exit (seconds) - reduced for aggressive trading
+    cooldown_seconds: int = Field(default=180, ge=0)
 
     @field_validator('symbol')
     @classmethod
@@ -85,30 +94,55 @@ class SymbolConfig(BaseModel):
         return v.upper()
 
 
+class TrailingStopConfig(BaseModel):
+    """Trailing stop configuration (v3 new feature)."""
+    enabled: bool = True
+
+    # Activation threshold - start trailing after X% profit
+    activation_pct: float = Field(default=0.4, ge=0.1, le=2.0)
+
+    # Trail distance - how far behind price to trail
+    trail_distance_pct: float = Field(default=0.25, ge=0.1, le=1.0)
+
+    # Move to breakeven when profit reaches this %
+    breakeven_at_pct: float = Field(default=0.3, ge=0.1, le=1.0)
+
+    # Minimum distance to maintain from current price
+    min_trail_distance_pct: float = Field(default=0.15, ge=0.05, le=0.5)
+
+
 class RiskConfig(BaseModel):
     """Risk management configuration with kill switches."""
     # Kill switches - mandatory
     max_daily_loss_pct: float = Field(default=5.0, ge=0.5, le=20.0)
-    max_consecutive_losses: int = Field(default=5, ge=1, le=20)
+    max_consecutive_losses: int = Field(default=4, ge=1, le=20)  # v3: reduced from 5
     max_total_exposure_pct: float = Field(default=50.0, ge=10, le=100)
     max_open_positions: int = Field(default=3, ge=1, le=10)
 
     # Position sizing
     default_risk_per_trade_pct: float = Field(default=1.0, ge=0.1, le=5.0)
     max_leverage: int = Field(default=5, ge=1, le=20)
-    min_leverage: int = Field(default=1, ge=1, le=5)
+    min_leverage: int = Field(default=2, ge=1, le=5)  # v3: increased from 1
 
-    # Stop-loss bounds (ATR-based, clamped to scalping range)
-    sl_atr_multiplier: float = Field(default=1.5, ge=0.5, le=5.0)
-    sl_min_pct: float = Field(default=0.3, ge=0.1, le=1.0)
-    sl_max_pct: float = Field(default=0.9, ge=0.5, le=3.0)
+    # Stop-loss bounds (v3: tighter for aggressive scalping)
+    sl_atr_multiplier: float = Field(default=1.0, ge=0.5, le=5.0)
+    sl_min_pct: float = Field(default=0.25, ge=0.1, le=1.0)
+    sl_max_pct: float = Field(default=0.6, ge=0.3, le=2.0)
+    sl_default_pct: float = Field(default=0.4, ge=0.2, le=1.0)
 
-    # Take-profit
-    tp_default_pct: float = Field(default=1.2, ge=0.5, le=5.0)
-    min_risk_reward_ratio: float = Field(default=1.2, ge=1.0, le=5.0)
+    # Take-profit (v3: tighter targets)
+    tp_default_pct: float = Field(default=0.8, ge=0.3, le=3.0)
+    tp_min_pct: float = Field(default=0.5, ge=0.2, le=1.0)
+    tp_max_pct: float = Field(default=1.5, ge=0.5, le=3.0)
+    min_risk_reward_ratio: float = Field(default=1.5, ge=1.0, le=5.0)  # v3: increased from 1.2
 
-    # Time-stop (minutes)
-    time_stop_minutes: int = Field(default=45, ge=5, le=240)
+    # Time-stop (v3: much shorter for scalping)
+    time_stop_minutes: int = Field(default=15, ge=3, le=120)
+    time_stop_profitable_minutes: int = Field(default=25, ge=5, le=60)  # v3: new
+    time_stop_losing_minutes: int = Field(default=10, ge=3, le=30)  # v3: new
+
+    # Trailing stop (v3 new)
+    trailing: TrailingStopConfig = Field(default_factory=TrailingStopConfig)
 
 
 class DataConfig(BaseModel):
@@ -117,10 +151,10 @@ class DataConfig(BaseModel):
     primary_timeframe: str = Field(default="1m")
     confirmation_timeframes: List[str] = Field(default=["5m", "15m"])
 
-    # Data integrity thresholds
-    max_candle_staleness_seconds: int = Field(default=120, ge=30, le=600)
+    # Data integrity thresholds (v3: tighter)
+    max_candle_staleness_seconds: int = Field(default=60, ge=30, le=300)  # v3: reduced from 120
     max_time_sync_drift_ms: int = Field(default=2000, ge=500, le=10000)
-    max_spread_pct: float = Field(default=0.15, ge=0.01, le=1.0)
+    max_spread_pct: float = Field(default=0.10, ge=0.01, le=1.0)  # v3: reduced from 0.15
     min_liquidity_usd: float = Field(default=50000, ge=1000)
 
     # Candle history for indicators
@@ -128,10 +162,17 @@ class DataConfig(BaseModel):
 
 
 class IndicatorConfig(BaseModel):
-    """Technical indicator configuration."""
+    """Technical indicator configuration with RSI extreme detection (v3)."""
     rsi_period: int = Field(default=14, ge=5, le=50)
     rsi_overbought: float = Field(default=70.0, ge=60, le=90)
     rsi_oversold: float = Field(default=30.0, ge=10, le=40)
+
+    # RSI Extreme thresholds (v3 new) - for strong standalone signals
+    rsi_extreme_oversold: float = Field(default=25.0, ge=10, le=35)
+    rsi_extreme_overbought: float = Field(default=75.0, ge=65, le=90)
+    rsi_very_extreme_oversold: float = Field(default=20.0, ge=5, le=25)
+    rsi_very_extreme_overbought: float = Field(default=80.0, ge=75, le=95)
+    rsi_extreme_override_enabled: bool = True  # v3: Allow RSI extreme to override fusion
 
     macd_fast: int = Field(default=12, ge=5, le=20)
     macd_slow: int = Field(default=26, ge=15, le=50)
@@ -147,7 +188,7 @@ class IndicatorConfig(BaseModel):
 
 
 class WhaleConfig(BaseModel):
-    """Whale detection configuration."""
+    """Whale detection configuration with entry signals (v3)."""
     enabled: bool = True
 
     # AggTrades detection
@@ -164,35 +205,60 @@ class WhaleConfig(BaseModel):
     # Alert cooldown
     alert_cooldown_seconds: int = Field(default=60, ge=10, le=300)
 
+    # Whale ENTRY signals (v3 new) - offensive whale trading
+    entry_signal_enabled: bool = True
+    entry_min_confidence: float = Field(default=0.7, ge=0.5, le=0.95)
+    entry_imbalance_threshold: float = Field(default=0.6, ge=0.4, le=0.9)
+    entry_strong_imbalance_threshold: float = Field(default=0.75, ge=0.6, le=0.95)
+    entry_min_large_trades: int = Field(default=3, ge=1, le=10)
+    entry_lookback_seconds: int = Field(default=120, ge=30, le=300)
+
 
 class SentimentConfig(BaseModel):
-    """Sentiment analysis configuration."""
+    """Sentiment analysis configuration with 6-hour cache (v3)."""
     enabled: bool = True
     provider: NewsProvider = NewsProvider.CRYPTOPANIC
 
-    # API settings
-    cache_ttl_seconds: int = Field(default=300, ge=60, le=1800)
-    max_articles_per_request: int = Field(default=50, ge=10, le=200)
+    # 6-hour cache strategy (v3 major change)
+    cache_duration_hours: int = Field(default=6, ge=1, le=24)
 
-    # Scoring
-    use_transformer: bool = False  # Default to VADER
+    # Scoring thresholds
+    bullish_threshold: float = Field(default=0.2, ge=0.1, le=0.5)
+    bearish_threshold: float = Field(default=-0.2, ge=-0.5, le=-0.1)
+    min_articles_for_confidence: int = Field(default=5, ge=1, le=20)
+
+    # Confidence scaling
+    max_confidence_articles: int = Field(default=20, ge=10, le=50)
     min_confidence_threshold: float = Field(default=0.3, ge=0, le=1)
 
-    # Rate limiting
-    rate_limit_requests_per_minute: int = Field(default=10, ge=1, le=60)
+    # Rate limiting (relaxed due to 6-hour cache)
+    request_timeout_seconds: int = Field(default=30, ge=10, le=60)
 
 
 class FusionConfig(BaseModel):
-    """Signal fusion configuration."""
-    # Entry threshold - skip if |final_score| below this
-    entry_threshold: float = Field(default=0.3, ge=0.1, le=0.8)
+    """Signal fusion configuration (v3 updated weights and thresholds)."""
+    # Entry threshold - skip if |final_score| below this (v3: increased)
+    entry_threshold: float = Field(default=0.4, ge=0.2, le=0.8)
 
-    # Confidence thresholds
-    min_confidence_for_entry: float = Field(default=0.4, ge=0.2, le=0.9)
-    high_confidence_threshold: float = Field(default=0.7, ge=0.5, le=0.95)
+    # Confidence thresholds (v3: adjusted)
+    min_confidence_for_entry: float = Field(default=0.45, ge=0.2, le=0.9)
+    high_confidence_threshold: float = Field(default=0.75, ge=0.5, le=0.95)
 
-    # Anti flip-flop
-    min_cooldown_after_exit_seconds: int = Field(default=300, ge=60, le=3600)
+    # Default weights (v3: rebalanced)
+    default_tech_weight: float = Field(default=0.45, ge=0, le=1)
+    default_whale_weight: float = Field(default=0.35, ge=0, le=1)
+    default_sentiment_weight: float = Field(default=0.20, ge=0, le=1)
+
+    # Dynamic weight adjustments (v3 new)
+    whale_strong_signal_weight_boost: float = Field(default=0.50, ge=0.3, le=0.7)
+    rsi_extreme_weight_boost: float = Field(default=0.55, ge=0.4, le=0.7)
+
+    # Override thresholds (v3 new)
+    rsi_extreme_override_confidence: float = Field(default=0.8, ge=0.6, le=0.95)
+    whale_entry_override_confidence: float = Field(default=0.85, ge=0.7, le=0.95)
+
+    # Anti flip-flop (v3: shorter cooldown)
+    min_cooldown_after_exit_seconds: int = Field(default=180, ge=30, le=3600)
     require_trend_confirmation: bool = True
     allow_counter_trend_high_confidence: bool = True
 
@@ -225,7 +291,7 @@ class Settings(BaseSettings):
     log_backup_count: int = Field(default=5)
 
     # === LOOP SETTINGS ===
-    main_loop_interval_seconds: float = Field(default=5.0, ge=1.0, le=60.0)
+    main_loop_interval_seconds: float = Field(default=3.0, ge=1.0, le=60.0)  # v3: faster
 
     # === SUB-CONFIGS ===
     risk: RiskConfig = Field(default_factory=RiskConfig)
@@ -286,11 +352,17 @@ class Settings(BaseSettings):
         """Generate safety banner for startup."""
         lines = [
             "=" * 60,
-            "TRADING BOT SAFETY STATUS",
+            "BINANCE FUTURES TRADING BOT v3",
+            "Aggressive Scalping | Trailing Stops | Whale Entry",
             "=" * 60,
             f"Environment:        {self.env.value.upper()}",
             f"Dry Run:            {self.dry_run}",
             f"Allow Live Trading: {self.allow_live_trading}",
+            "-" * 60,
+            f"TP Target:          {self.risk.tp_default_pct}%",
+            f"SL Target:          {self.risk.sl_default_pct}%",
+            f"Time Stop:          {self.risk.time_stop_minutes} minutes",
+            f"Trailing Stop:      {'Enabled' if self.risk.trailing.enabled else 'Disabled'}",
             "-" * 60,
         ]
 

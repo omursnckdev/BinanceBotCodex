@@ -1,17 +1,18 @@
 """
-Technical indicators module.
+Technical indicators module (v3).
 Computes RSI, MACD, Bollinger Bands, ATR, EMA and generates trading signals.
+Includes RSI extreme detection for strong standalone entry signals.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, Any
 
 import numpy as np
 import pandas as pd
 
-from config import IndicatorConfig, Trend, get_settings
+from config import IndicatorConfig, Trend, RSIExtremeDirection, get_settings
 from utils.logger import get_logger
 
 
@@ -20,7 +21,7 @@ logger = get_logger(__name__)
 
 @dataclass
 class TechnicalSignal:
-    """Technical analysis signal output."""
+    """Technical analysis signal output (v3 with RSI extreme)."""
     symbol: str
 
     # Core outputs
@@ -45,6 +46,12 @@ class TechnicalSignal:
     ema_slow: float
     current_price: float
 
+    # RSI Extreme Detection (v3 new)
+    rsi_extreme: bool = False
+    rsi_extreme_direction: RSIExtremeDirection = RSIExtremeDirection.NONE
+    rsi_extreme_score: float = 0.0  # Standalone RSI extreme score
+    rsi_extreme_confidence: float = 0.0  # Confidence in RSI extreme signal
+
     # Validity
     is_valid: bool = True
     error_message: str = ""
@@ -58,6 +65,9 @@ class TechnicalSignal:
             "trend": self.trend.value,
             "atr_pct": round(self.atr_pct, 4),
             "rsi": round(self.rsi, 2),
+            "rsi_extreme": self.rsi_extreme,
+            "rsi_extreme_direction": self.rsi_extreme_direction.value,
+            "rsi_extreme_confidence": round(self.rsi_extreme_confidence, 4),
             "macd_histogram": round(self.macd_histogram, 6),
             "bb_position": round(self.bb_position, 4),
             "is_valid": self.is_valid,
@@ -66,8 +76,9 @@ class TechnicalSignal:
 
 class TechnicalIndicators:
     """
-    Technical indicator calculator.
+    Technical indicator calculator (v3).
     Thread-safe, stateless computation on provided OHLCV data.
+    Includes RSI extreme value detection for strong entry signals.
     """
 
     def __init__(self, config: Optional[IndicatorConfig] = None):
@@ -170,9 +181,70 @@ class TechnicalIndicators:
         """Calculate Exponential Moving Average."""
         return prices.ewm(span=period, adjust=False).mean()
 
+    def _score_rsi_extreme(self, rsi: float) -> Tuple[float, float, RSIExtremeDirection, bool]:
+        """
+        Score RSI for extreme values (v3 new).
+
+        RSI extreme values generate strong standalone signals that can
+        override low fusion scores.
+
+        Args:
+            rsi: Current RSI value
+
+        Returns:
+            Tuple of (score, confidence, direction, is_extreme)
+        """
+        very_oversold = self.config.rsi_very_extreme_oversold
+        oversold = self.config.rsi_extreme_oversold
+        overbought = self.config.rsi_extreme_overbought
+        very_overbought = self.config.rsi_very_extreme_overbought
+
+        # VERY EXTREME OVERSOLD - Very strong BUY signal
+        if rsi <= very_oversold:
+            return 0.95, 0.90, RSIExtremeDirection.OVERSOLD, True
+
+        # STRONG OVERSOLD - Strong BUY signal
+        if rsi <= oversold:
+            # Scale score between 0.85 and 0.95 based on how close to very_extreme
+            score = 0.85 + (oversold - rsi) / (oversold - very_oversold) * 0.10
+            confidence = 0.80 + (oversold - rsi) / (oversold - very_oversold) * 0.10
+            return score, confidence, RSIExtremeDirection.OVERSOLD, True
+
+        # MODERATE OVERSOLD (between extreme threshold and standard threshold)
+        if rsi <= self.config.rsi_oversold:
+            score = 0.60 + (self.config.rsi_oversold - rsi) / (self.config.rsi_oversold - oversold) * 0.25
+            confidence = 0.65
+            return score, confidence, RSIExtremeDirection.OVERSOLD, False
+
+        # VERY EXTREME OVERBOUGHT - Very strong SELL signal
+        if rsi >= very_overbought:
+            return -0.95, 0.90, RSIExtremeDirection.OVERBOUGHT, True
+
+        # STRONG OVERBOUGHT - Strong SELL signal
+        if rsi >= overbought:
+            # Scale score between -0.85 and -0.95
+            score = -0.85 - (rsi - overbought) / (very_overbought - overbought) * 0.10
+            confidence = 0.80 + (rsi - overbought) / (very_overbought - overbought) * 0.10
+            return score, confidence, RSIExtremeDirection.OVERBOUGHT, True
+
+        # MODERATE OVERBOUGHT
+        if rsi >= self.config.rsi_overbought:
+            score = -0.60 - (rsi - self.config.rsi_overbought) / (overbought - self.config.rsi_overbought) * 0.25
+            confidence = 0.65
+            return score, confidence, RSIExtremeDirection.OVERBOUGHT, False
+
+        # NEUTRAL ZONE - Weak signal
+        mid = 50
+        if rsi > mid:
+            score = -((rsi - mid) / (self.config.rsi_overbought - mid)) * 0.3
+        else:
+            score = ((mid - rsi) / (mid - self.config.rsi_oversold)) * 0.3
+
+        return score, 0.3, RSIExtremeDirection.NONE, False
+
     def _score_rsi(self, rsi: float) -> Tuple[float, float]:
         """
-        Score RSI indicator.
+        Score RSI indicator (standard scoring for fusion).
 
         Returns:
             Tuple of (score -1 to +1, confidence 0 to 1)
@@ -183,18 +255,18 @@ class TechnicalIndicators:
         if rsi >= overbought:
             # Overbought - bearish signal
             score = -((rsi - overbought) / (100 - overbought))
-            confidence = min((rsi - overbought) / 20, 1.0)  # Max confidence at RSI 90
+            confidence = min((rsi - overbought) / 20, 1.0)
         elif rsi <= oversold:
             # Oversold - bullish signal
             score = (oversold - rsi) / oversold
-            confidence = min((oversold - rsi) / 20, 1.0)  # Max confidence at RSI 10
+            confidence = min((oversold - rsi) / 20, 1.0)
         else:
             # Neutral zone
             mid = (overbought + oversold) / 2
             if rsi > mid:
-                score = -((rsi - mid) / (overbought - mid)) * 0.3  # Weak bearish
+                score = -((rsi - mid) / (overbought - mid)) * 0.3
             else:
-                score = ((mid - rsi) / (mid - oversold)) * 0.3  # Weak bullish
+                score = ((mid - rsi) / (mid - oversold)) * 0.3
             confidence = 0.3
 
         return np.clip(score, -1, 1), np.clip(confidence, 0, 1)
@@ -230,7 +302,7 @@ class TechnicalIndicators:
             score = 0
 
         # Confidence based on histogram magnitude
-        confidence = min(abs(histogram) * 1000, 1.0)  # Scale appropriately
+        confidence = min(abs(histogram) * 1000, 1.0)
 
         return np.clip(score, -1, 1), np.clip(confidence, 0.1, 1)
 
@@ -250,8 +322,6 @@ class TechnicalIndicators:
         position = np.clip(position, -1.5, 1.5)
 
         # Score: mean reversion assumption
-        # Near upper band = bearish (expect reversion down)
-        # Near lower band = bullish (expect reversion up)
         if position > 1:
             score = -(position - 1) / 0.5  # Overbought
         elif position < -1:
@@ -263,36 +333,24 @@ class TechnicalIndicators:
 
     def analyze(self, df: pd.DataFrame, symbol: str = "UNKNOWN") -> TechnicalSignal:
         """
-        Perform full technical analysis on OHLCV DataFrame.
+        Perform full technical analysis on OHLCV DataFrame (v3).
 
         Args:
             df: DataFrame with columns: open, high, low, close, volume
             symbol: Symbol name for logging
 
         Returns:
-            TechnicalSignal with computed indicators and score
+            TechnicalSignal with computed indicators, score, and RSI extreme detection
         """
         try:
             # Validate input
             required_cols = ['open', 'high', 'low', 'close']
             if not all(col in df.columns for col in required_cols):
-                return TechnicalSignal(
-                    symbol=symbol, tech_score=0, tech_confidence=0, trend=Trend.NEUTRAL,
-                    atr_value=0, atr_pct=0, rsi=50, macd=0, macd_signal=0, macd_histogram=0,
-                    bb_upper=0, bb_middle=0, bb_lower=0, bb_position=0,
-                    ema_fast=0, ema_slow=0, current_price=0,
-                    is_valid=False, error_message="Missing required OHLCV columns"
-                )
+                return self._create_invalid_signal(symbol, "Missing required OHLCV columns")
 
             min_rows = max(self.config.ema_slow, self.config.bb_period, self.config.macd_slow) + 10
             if len(df) < min_rows:
-                return TechnicalSignal(
-                    symbol=symbol, tech_score=0, tech_confidence=0, trend=Trend.NEUTRAL,
-                    atr_value=0, atr_pct=0, rsi=50, macd=0, macd_signal=0, macd_histogram=0,
-                    bb_upper=0, bb_middle=0, bb_lower=0, bb_position=0,
-                    ema_fast=0, ema_slow=0, current_price=0,
-                    is_valid=False, error_message=f"Insufficient data: {len(df)} rows, need {min_rows}"
-                )
+                return self._create_invalid_signal(symbol, f"Insufficient data: {len(df)} rows, need {min_rows}")
 
             close = df['close']
             current_price = float(close.iloc[-1])
@@ -321,13 +379,7 @@ class TechnicalIndicators:
             # Check for NaN values
             values = [current_rsi, current_macd, current_atr, current_ema_fast, current_ema_slow]
             if any(pd.isna(v) for v in values):
-                return TechnicalSignal(
-                    symbol=symbol, tech_score=0, tech_confidence=0, trend=Trend.NEUTRAL,
-                    atr_value=0, atr_pct=0, rsi=50, macd=0, macd_signal=0, macd_histogram=0,
-                    bb_upper=0, bb_middle=0, bb_lower=0, bb_position=0,
-                    ema_fast=0, ema_slow=0, current_price=current_price,
-                    is_valid=False, error_message="NaN values in indicators"
-                )
+                return self._create_invalid_signal(symbol, "NaN values in indicators", current_price)
 
             # ATR as percentage
             atr_pct = (current_atr / current_price * 100) if current_price > 0 else 0
@@ -339,6 +391,9 @@ class TechnicalIndicators:
                 trend = Trend.BEARISH
             else:
                 trend = Trend.NEUTRAL
+
+            # RSI Extreme Detection (v3 new)
+            rsi_extreme_score, rsi_extreme_conf, rsi_extreme_dir, is_rsi_extreme = self._score_rsi_extreme(current_rsi)
 
             # Score individual indicators
             rsi_score, rsi_conf = self._score_rsi(current_rsi)
@@ -356,21 +411,28 @@ class TechnicalIndicators:
                 trend_score = 0
 
             # Combine scores (weighted average)
-            # RSI: 25%, MACD: 35%, BB: 25%, Trend: 15%
+            # RSI: 30%, MACD: 30%, BB: 25%, Trend: 15% (v3: slightly more weight on RSI)
             tech_score = (
-                rsi_score * 0.25 +
-                macd_score * 0.35 +
+                rsi_score * 0.30 +
+                macd_score * 0.30 +
                 bb_score * 0.25 +
                 trend_score * 0.15
             )
 
             # Combine confidence
-            tech_confidence = (rsi_conf * 0.3 + macd_conf * 0.4 + 0.3)  # Base confidence
+            tech_confidence = (rsi_conf * 0.35 + macd_conf * 0.35 + 0.3)  # Base confidence
+
+            # Boost confidence if RSI is extreme
+            if is_rsi_extreme:
+                tech_confidence = max(tech_confidence, rsi_extreme_conf)
+                # Also boost tech_score toward RSI extreme direction
+                tech_score = tech_score * 0.6 + rsi_extreme_score * 0.4
 
             # Reduce confidence if indicators disagree
             scores = [rsi_score, macd_score, bb_score]
             if not all(s >= 0 for s in scores) and not all(s <= 0 for s in scores):
-                tech_confidence *= 0.7  # Reduce confidence on mixed signals
+                if not is_rsi_extreme:  # Don't reduce if RSI extreme
+                    tech_confidence *= 0.7
 
             return TechnicalSignal(
                 symbol=symbol,
@@ -390,18 +452,49 @@ class TechnicalIndicators:
                 ema_fast=current_ema_fast,
                 ema_slow=current_ema_slow,
                 current_price=current_price,
+                rsi_extreme=is_rsi_extreme,
+                rsi_extreme_direction=rsi_extreme_dir,
+                rsi_extreme_score=rsi_extreme_score,
+                rsi_extreme_confidence=rsi_extreme_conf,
                 is_valid=True,
             )
 
         except Exception as e:
             logger.error(f"Technical analysis error: {e}", extra={"symbol": symbol})
-            return TechnicalSignal(
-                symbol=symbol, tech_score=0, tech_confidence=0, trend=Trend.NEUTRAL,
-                atr_value=0, atr_pct=0, rsi=50, macd=0, macd_signal=0, macd_histogram=0,
-                bb_upper=0, bb_middle=0, bb_lower=0, bb_position=0,
-                ema_fast=0, ema_slow=0, current_price=0,
-                is_valid=False, error_message=str(e)
-            )
+            return self._create_invalid_signal(symbol, str(e))
+
+    def _create_invalid_signal(
+        self,
+        symbol: str,
+        error_message: str,
+        current_price: float = 0.0
+    ) -> TechnicalSignal:
+        """Create an invalid TechnicalSignal with default values."""
+        return TechnicalSignal(
+            symbol=symbol,
+            tech_score=0,
+            tech_confidence=0,
+            trend=Trend.NEUTRAL,
+            atr_value=0,
+            atr_pct=0,
+            rsi=50,
+            macd=0,
+            macd_signal=0,
+            macd_histogram=0,
+            bb_upper=0,
+            bb_middle=0,
+            bb_lower=0,
+            bb_position=0,
+            ema_fast=0,
+            ema_slow=0,
+            current_price=current_price,
+            rsi_extreme=False,
+            rsi_extreme_direction=RSIExtremeDirection.NONE,
+            rsi_extreme_score=0,
+            rsi_extreme_confidence=0,
+            is_valid=False,
+            error_message=error_message,
+        )
 
     def analyze_multi_timeframe(
         self,
