@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """
-Binance Futures Trading Bot - Main Entry Point
+Binance Futures Trading Bot - Main Entry Point (v3)
 
-A production-grade scalping bot for Binance USDT-M Futures.
+A production-grade aggressive scalping bot for Binance USDT-M Futures.
 Testnet-first design with multiple safety layers.
+
+v3 Features:
+- Aggressive scalping (TP 0.8%, SL 0.4%, 15min time stop)
+- Trailing stops for profit protection
+- RSI extreme detection with override capability
+- Whale entry signals for momentum trading
+- 6-hour sentiment cache for API efficiency
 
 IMPORTANT SAFETY NOTES:
 - Default config is TESTNET + DRY_RUN + ALLOW_LIVE_TRADING=false
@@ -40,9 +47,15 @@ logger = get_logger(__name__)
 
 class TradingBot:
     """
-    Main trading bot orchestrator.
+    Main trading bot orchestrator (v3).
 
     Coordinates all modules and runs the main event loop.
+
+    v3 Enhancements:
+    - 3-second loop interval for scalping
+    - Sentiment refresh every 6 hours
+    - Trailing stop updates on every tick
+    - Graduated time-stop logic
     """
 
     def __init__(self):
@@ -99,13 +112,31 @@ class TradingBot:
         logger.info("All components initialized successfully")
 
     def _print_startup_banner(self) -> None:
-        """Print startup banner with safety status."""
+        """Print startup banner with safety status (v3)."""
+        risk = self.settings.risk
         print("\n" + "=" * 60)
-        print("BINANCE FUTURES TRADING BOT")
+        print("BINANCE FUTURES TRADING BOT v3 - AGGRESSIVE SCALPING")
         print("=" * 60)
         print(self.settings.print_safety_banner())
         print(f"\nTrading Symbols: {', '.join(self.settings.trading_symbols)}")
         print(f"Main Loop Interval: {self.settings.main_loop_interval_seconds}s")
+        print("-" * 60)
+        print("v3 SCALPING PARAMETERS:")
+        print(f"  Take Profit: {risk.tp_default_pct}%")
+        print(f"  Stop Loss: {risk.sl_min_pct}% - {risk.sl_max_pct}%")
+        print(f"  Time Stop: {risk.time_stop_minutes} min (default)")
+        print(f"  Trailing Stop: {'ENABLED' if risk.trailing.enabled else 'DISABLED'}")
+        if risk.trailing.enabled:
+            print(f"    - Breakeven at: {risk.trailing.breakeven_at_pct}%")
+            print(f"    - Activation: {risk.trailing.activation_pct}%")
+            print(f"    - Trail Distance: {risk.trailing.trail_distance_pct}%")
+        print(f"  Leverage: {risk.min_leverage}x - {risk.max_leverage}x")
+        print(f"  Risk-Reward Ratio: {risk.min_risk_reward_ratio}:1")
+        print("-" * 60)
+        print("v3 SIGNAL FEATURES:")
+        print(f"  RSI Extreme Override: {'ENABLED' if self.settings.indicators.rsi_extreme_override_enabled else 'DISABLED'}")
+        print(f"  Whale Entry Signals: {'ENABLED' if self.settings.whale.entry_signal_enabled else 'DISABLED'}")
+        print(f"  Sentiment Cache: {self.settings.sentiment.cache_duration_hours} hours")
         print("=" * 60 + "\n")
 
         if self.settings.is_live_trading_enabled():
@@ -202,6 +233,20 @@ class TradingBot:
 
             # Handle existing position
             if position:
+                # v3: Calculate current PnL for graduated time-stop
+                if position.side == "LONG":
+                    current_pnl_pct = ((tech_signal.current_price - position.entry_price) / position.entry_price) * 100
+                else:
+                    current_pnl_pct = ((position.entry_price - tech_signal.current_price) / position.entry_price) * 100
+
+                # v3: Update trailing stop
+                if decision.trailing_stop_active:
+                    trail_result = self._executor.update_trailing_stop(
+                        symbol, tech_signal.current_price
+                    )
+                    if trail_result.success and "updated" in trail_result.message.lower():
+                        logger.info(f"Trailing stop: {trail_result.message}")
+
                 # Check for defensive action (EXPLICIT - not FLAT)
                 if decision.recommended_defensive_action and decision.recommended_defensive_action != WhaleDefensiveAction.NONE:
                     logger.info(
@@ -212,25 +257,40 @@ class TradingBot:
                         symbol,
                         decision.recommended_defensive_action
                     )
+                    # v3: Reset trailing stop after close
+                    self._risk_manager.reset_trailing_stop(symbol)
                     return
 
                 # Check for explicit exit
                 if decision.exit_reason:
                     logger.info(f"Closing position: {decision.exit_reason}")
                     self._executor.execute_close(symbol, decision.exit_reason)
+                    self._risk_manager.reset_trailing_stop(symbol)
                     return
 
-                # Check time-based exit and other conditions
+                # v3: Check graduated time-stop
+                should_time_stop, time_reason = self._executor.check_time_stop(
+                    symbol, current_pnl_pct
+                )
+                if should_time_stop:
+                    logger.info(f"Closing position: {time_reason}")
+                    self._executor.execute_close(symbol, time_reason)
+                    self._risk_manager.reset_trailing_stop(symbol)
+                    return
+
+                # Check other exit conditions (whale signal, opposite signal)
                 should_close, reason = self._fusion.should_close_position(
                     decision=decision,
                     position_side=position.side,
-                    position_entry_time=position.entry_time,
+                    position_entry_time=position.opened_at,
                     position_entry_price=position.entry_price,
                     current_price=tech_signal.current_price,
+                    current_pnl_pct=current_pnl_pct,
                 )
                 if should_close:
                     logger.info(f"Closing position: {reason}")
                     self._executor.execute_close(symbol, reason)
+                    self._risk_manager.reset_trailing_stop(symbol)
                     return
 
             # No position - check for entry
@@ -252,6 +312,18 @@ class TradingBot:
                     )
                     if result.success:
                         logger.info(f"Entry executed: {result.message}")
+                        # v3: Initialize trailing stop for new position
+                        if result.fill_price and decision.trailing_stop_active:
+                            position_side = "LONG" if decision.action == TradingAction.LONG else "SHORT"
+                            sl_price = self._risk_manager.get_stop_loss_price(
+                                result.fill_price, position_side, decision.stop_loss_pct
+                            )
+                            self._executor.initialize_trailing_stop(
+                                symbol=symbol,
+                                entry_price=result.fill_price,
+                                side=position_side,
+                                initial_stop=sl_price,
+                            )
                     else:
                         logger.warning(f"Entry failed: {result.message}")
 
@@ -259,9 +331,16 @@ class TradingBot:
             logger.error(f"Error processing {symbol}: {e}", exc_info=True)
 
     def _run_cycle(self) -> None:
-        """Run one cycle of the trading loop."""
+        """Run one cycle of the trading loop (v3)."""
         # Check daily reset
         self._check_daily_reset()
+
+        # v3: Refresh sentiment cache if needed (every 6 hours)
+        try:
+            if self._sentiment.refresh_if_needed():
+                logger.info("Sentiment cache refreshed")
+        except Exception as e:
+            logger.warning(f"Sentiment refresh failed: {e}")
 
         # Check risk status
         risk_status = self._risk_manager.check_risk_status()
