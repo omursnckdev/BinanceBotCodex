@@ -1,17 +1,24 @@
 """
-Risk management module with kill switches.
+Risk management module with kill switches (v3).
 Implements mandatory safety controls for trading.
+
+v3 Features:
+- Tighter scalping parameters
+- Trailing stop integration
+- Graduated time-stop logic
+- ATR-bounded stop loss calculation
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, date
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from enum import Enum
 
 from config import RiskConfig, get_settings
 from exchange.binance_client import BinanceClient, Position
+from risk.trailing_stop import TrailingStopManager, TrailingStopState
 from utils.logger import get_logger
 
 
@@ -83,13 +90,19 @@ class DailyStats:
 
 class RiskManager:
     """
-    Risk manager with kill switches.
+    Risk manager with kill switches (v3).
 
     Kill switches (mandatory):
-    1. max_daily_loss -> stop trading for the day
-    2. max_consecutive_losses -> stop opening new trades
-    3. max_total_exposure_pct -> cap portfolio exposure
-    4. max_open_positions -> cap number of positions
+    1. max_daily_loss -> stop trading for the day (5%)
+    2. max_consecutive_losses -> stop opening new trades (4)
+    3. max_total_exposure_pct -> cap portfolio exposure (50%)
+    4. max_open_positions -> cap number of positions (3)
+
+    v3 Features:
+    - Trailing stop manager integration
+    - Tighter scalping parameters (TP 0.8%, SL 0.4%)
+    - ATR-bounded stop loss calculation
+    - Graduated time-stop logic
     """
 
     def __init__(
@@ -99,6 +112,9 @@ class RiskManager:
     ):
         self.client = client
         self.config = config or get_settings().risk
+
+        # v3: Trailing stop manager
+        self.trailing_manager = TrailingStopManager(self.config.trailing)
 
         # Daily tracking
         self._daily_stats: Optional[DailyStats] = None
@@ -403,3 +419,216 @@ class RiskManager:
         self._daily_stats = None
         self._last_check_date = None
         self._initialize_daily_stats()
+
+    # ==================== v3 FEATURES ====================
+
+    def calculate_atr_bounded_stop_loss(
+        self,
+        entry_price: float,
+        side: str,
+        atr_pct: float,
+    ) -> Tuple[float, float]:
+        """
+        Calculate ATR-bounded stop loss for scalping (v3).
+
+        Args:
+            entry_price: Actual entry fill price
+            side: 'LONG' or 'SHORT'
+            atr_pct: ATR as percentage of price
+
+        Returns:
+            Tuple of (stop_loss_price, stop_loss_pct)
+        """
+        # ATR-based calculation with multiplier
+        sl_pct = atr_pct * self.config.sl_atr_multiplier
+
+        # Clamp to scalping bounds
+        sl_pct = max(self.config.sl_min_pct, min(sl_pct, self.config.sl_max_pct))
+
+        # Calculate price
+        if side.upper() == "LONG":
+            sl_price = entry_price * (1 - sl_pct / 100)
+        else:
+            sl_price = entry_price * (1 + sl_pct / 100)
+
+        return sl_price, sl_pct
+
+    def calculate_take_profit_from_sl(
+        self,
+        entry_price: float,
+        side: str,
+        stop_loss_pct: float,
+    ) -> Tuple[float, float]:
+        """
+        Calculate take profit ensuring minimum risk-reward ratio (v3).
+
+        Args:
+            entry_price: Actual entry fill price
+            side: 'LONG' or 'SHORT'
+            stop_loss_pct: Stop loss percentage
+
+        Returns:
+            Tuple of (take_profit_price, take_profit_pct)
+        """
+        # Ensure minimum risk-reward ratio (default 1.5:1)
+        tp_pct = max(
+            stop_loss_pct * self.config.min_risk_reward_ratio,
+            self.config.tp_default_pct
+        )
+
+        # Cap at maximum
+        tp_pct = min(tp_pct, self.config.tp_max_pct)
+
+        # Calculate price
+        if side.upper() == "LONG":
+            tp_price = entry_price * (1 + tp_pct / 100)
+        else:
+            tp_price = entry_price * (1 - tp_pct / 100)
+
+        return tp_price, tp_pct
+
+    def check_time_stop(
+        self,
+        position_age_minutes: float,
+        current_pnl_pct: float,
+    ) -> Tuple[bool, str]:
+        """
+        Check graduated time stop based on PnL (v3).
+
+        - Profitable positions: Allow more time (25 min)
+        - Losing positions: Exit faster (10 min)
+        - Default: 15 minutes
+
+        Args:
+            position_age_minutes: How long position has been open
+            current_pnl_pct: Current PnL percentage
+
+        Returns:
+            Tuple of (should_close, reason)
+        """
+        # If profitable, allow more time
+        if current_pnl_pct > 0.3:
+            if position_age_minutes >= self.config.time_stop_profitable_minutes:
+                return True, f"Time-stop (profitable): {position_age_minutes:.0f} min"
+
+        # If slightly negative, exit faster
+        elif current_pnl_pct < -0.1:
+            if position_age_minutes >= self.config.time_stop_losing_minutes:
+                return True, f"Time-stop (losing): {position_age_minutes:.0f} min"
+
+        # Default time stop
+        elif position_age_minutes >= self.config.time_stop_minutes:
+            return True, f"Time-stop (default): {position_age_minutes:.0f} min"
+
+        return False, ""
+
+    def initialize_trailing_stop(
+        self,
+        symbol: str,
+        entry_price: float,
+        side: str,
+        initial_stop: float,
+    ) -> TrailingStopState:
+        """
+        Initialize trailing stop for a new position (v3).
+
+        Args:
+            symbol: Trading pair
+            entry_price: Actual fill price
+            side: 'LONG' or 'SHORT'
+            initial_stop: Initial stop loss price
+
+        Returns:
+            TrailingStopState for the position
+        """
+        return self.trailing_manager.initialize_position(
+            symbol=symbol,
+            entry_price=entry_price,
+            side=side,
+            initial_stop=initial_stop,
+        )
+
+    def update_trailing_stop(
+        self,
+        symbol: str,
+        current_price: float,
+    ) -> Tuple[bool, float, str]:
+        """
+        Update trailing stop for a position (v3).
+
+        Args:
+            symbol: Trading pair
+            current_price: Current market price
+
+        Returns:
+            Tuple of (should_update, new_stop, reason)
+        """
+        return self.trailing_manager.update(symbol, current_price)
+
+    def reset_trailing_stop(self, symbol: str) -> None:
+        """Reset trailing stop state after position close (v3)."""
+        self.trailing_manager.reset(symbol)
+
+    def get_trailing_stop_summary(self, symbol: str) -> Dict[str, Any]:
+        """Get trailing stop state summary for logging (v3)."""
+        return self.trailing_manager.get_summary(symbol)
+
+    def calculate_leverage(
+        self,
+        confidence: float,
+        rsi_extreme: bool = False,
+    ) -> int:
+        """
+        Calculate dynamic leverage based on confidence (v3).
+
+        Args:
+            confidence: Signal confidence (0-1)
+            rsi_extreme: Whether RSI is at extreme value
+
+        Returns:
+            Leverage to use
+        """
+        min_lev = self.config.min_leverage
+        max_lev = self.config.max_leverage
+
+        # RSI extreme = higher confidence in direction
+        if rsi_extreme and confidence > 0.7:
+            return max_lev
+
+        if confidence >= 0.85:
+            return max_lev
+        elif confidence >= 0.70:
+            return min(max_lev, 4)
+        elif confidence >= 0.55:
+            return min(max_lev, 3)
+        else:
+            return min_lev
+
+    def get_risk_summary(self) -> Dict[str, Any]:
+        """
+        Get comprehensive risk summary for logging (v3).
+
+        Returns:
+            Dict with all risk parameters and status
+        """
+        status = self.check_risk_status()
+
+        return {
+            "status": status.to_dict(),
+            "config": {
+                "max_daily_loss_pct": self.config.max_daily_loss_pct,
+                "max_consecutive_losses": self.config.max_consecutive_losses,
+                "max_exposure_pct": self.config.max_total_exposure_pct,
+                "max_positions": self.config.max_open_positions,
+                "sl_bounds": [self.config.sl_min_pct, self.config.sl_max_pct],
+                "tp_default": self.config.tp_default_pct,
+                "min_risk_reward": self.config.min_risk_reward_ratio,
+                "time_stop_minutes": self.config.time_stop_minutes,
+            },
+            "trailing_stop": {
+                "enabled": self.config.trailing.enabled,
+                "activation_pct": self.config.trailing.activation_pct,
+                "trail_distance_pct": self.config.trailing.trail_distance_pct,
+                "breakeven_at_pct": self.config.trailing.breakeven_at_pct,
+            },
+        }
