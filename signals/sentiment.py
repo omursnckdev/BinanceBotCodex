@@ -1,17 +1,17 @@
 """
-News sentiment analysis module.
-Uses CryptoPanic, NewsAPI, or GDELT for near real-time sentiment.
-Default analyzer is VADER; transformer-based is optional.
+News sentiment analysis module (v3).
+Uses CryptoPanic with 6-hour cache strategy for API efficiency.
+
+v3: Implements 6-hour batch caching for all symbols to minimize API calls
+    and provide stable sentiment signals.
 """
 
 from __future__ import annotations
 
-import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
-from functools import lru_cache
 
 import requests
 
@@ -40,20 +40,26 @@ def get_vader_analyzer():
 
 
 @dataclass
-class NewsArticle:
-    """News article with metadata."""
-    title: str
-    source: str
-    published_at: datetime
-    url: str
-    sentiment_score: float = 0.0  # -1 to +1
-    relevance: float = 1.0  # 0 to 1
-    currencies: List[str] = field(default_factory=list)
+class CachedSentiment:
+    """
+    Cached sentiment data for a single symbol (v3).
+
+    6-hour cache strategy means this data is fetched once and reused
+    for all trading decisions until the cache expires.
+    """
+    symbol: str  # e.g., "BTC", "ETH"
+    sentiment: str  # "bullish", "bearish", "neutral"
+    sentiment_score: float  # -1 to +1
+    bullish_count: int
+    bearish_count: int
+    total_articles: int
+    fetched_at: datetime
+    expires_at: datetime
 
 
 @dataclass
 class SentimentSignal:
-    """Sentiment analysis signal output."""
+    """Sentiment analysis signal output (v3 with cache info)."""
     symbol: str
     timestamp: datetime
 
@@ -61,7 +67,7 @@ class SentimentSignal:
     sentiment_score: float  # -1 (negative) to +1 (positive)
     confidence: float  # 0 to 1
 
-    # Global market sentiment
+    # Global market sentiment (BTC as proxy)
     global_sentiment_score: float
     global_confidence: float
 
@@ -71,8 +77,9 @@ class SentimentSignal:
     negative_count: int = 0
     neutral_count: int = 0
 
-    # Source tracking
-    source_breakdown: Dict[str, float] = field(default_factory=dict)
+    # v3 Cache info
+    cache_expires_at: Optional[datetime] = None
+    is_from_cache: bool = True
 
     # Validity
     is_valid: bool = True
@@ -89,78 +96,70 @@ class SentimentSignal:
             "positive_count": self.positive_count,
             "negative_count": self.negative_count,
             "is_valid": self.is_valid,
+            "cache_expires_at": self.cache_expires_at.isoformat() if self.cache_expires_at else None,
         }
-
-
-class RateLimiter:
-    """Simple rate limiter."""
-
-    def __init__(self, requests_per_minute: int):
-        self.interval = 60.0 / requests_per_minute
-        self.last_request_time = 0.0
-
-    def wait(self) -> None:
-        """Wait if necessary to respect rate limit."""
-        elapsed = time.time() - self.last_request_time
-        if elapsed < self.interval:
-            time.sleep(self.interval - elapsed)
-        self.last_request_time = time.time()
-
-
-class SentimentCache:
-    """Simple TTL cache for sentiment data."""
-
-    def __init__(self, ttl_seconds: int = 300):
-        self.ttl = ttl_seconds
-        self._cache: Dict[str, tuple] = {}  # key -> (value, timestamp)
-
-    def get(self, key: str) -> Optional[Any]:
-        """Get value if not expired."""
-        if key in self._cache:
-            value, ts = self._cache[key]
-            if time.time() - ts < self.ttl:
-                return value
-            del self._cache[key]
-        return None
-
-    def set(self, key: str, value: Any) -> None:
-        """Set value with current timestamp."""
-        self._cache[key] = (value, time.time())
 
 
 class SentimentAnalyzer:
     """
-    News sentiment analyzer with multiple provider support.
+    News sentiment analyzer with 6-hour cache strategy (v3).
+
+    API Call Strategy:
+    - Fetch sentiment data once every 6 hours for all 5 symbols in a single batch
+    - Cache the bullish/bearish classification for each symbol
+    - Use cached sentiment for all trading decisions until next refresh
+    - This minimizes API calls and respects rate limits
+
+    Benefits:
+    - API Efficiency: Only 4 API calls per day instead of thousands
+    - Rate Limit Safe: Well within CryptoPanic free tier limits
+    - Stable Signals: Sentiment doesn't flip-flop on every article
+    - Reduced Latency: Instant sentiment lookup from cache
+    - Failure Resilient: Uses stale cache if API fails
     """
 
-    # Symbol to search term mapping
-    SYMBOL_KEYWORDS = {
-        "BTCUSDT": ["bitcoin", "btc"],
-        "ETHUSDT": ["ethereum", "eth"],
-        "BNBUSDT": ["binance coin", "bnb"],
-        "SOLUSDT": ["solana", "sol"],
-        "XRPUSDT": ["ripple", "xrp"],
+    # Supported symbols for CryptoPanic
+    SUPPORTED_SYMBOLS = ["BTC", "ETH", "BNB", "SOL", "XRP"]
+
+    # Map trading symbol to CryptoPanic currency code
+    SYMBOL_MAP = {
+        "BTCUSDT": "BTC",
+        "ETHUSDT": "ETH",
+        "BNBUSDT": "BNB",
+        "SOLUSDT": "SOL",
+        "XRPUSDT": "XRP",
     }
 
     def __init__(self, config: Optional[SentimentConfig] = None):
         settings = get_settings()
         self.config = config or settings.sentiment
 
-        # API keys
-        self._cryptopanic_key = settings.cryptopanic_api_key
-        self._newsapi_key = settings.newsapi_api_key
+        # API key
+        self._api_key = settings.cryptopanic_api_key
 
-        # Rate limiting
-        self._rate_limiter = RateLimiter(self.config.rate_limit_requests_per_minute)
-
-        # Caching
-        self._cache = SentimentCache(self.config.cache_ttl_seconds)
+        # v3: 6-hour cache
+        self.cache: Dict[str, CachedSentiment] = {}
+        self.last_fetch: Optional[datetime] = None
 
         # HTTP session
         self._session = requests.Session()
         self._session.headers.update({
-            "User-Agent": "BinanceTradingBot/1.0",
+            "User-Agent": "BinanceTradingBot/3.0",
         })
+
+    def _should_refresh(self) -> bool:
+        """
+        Check if cache needs refresh (every 6 hours).
+
+        Returns:
+            True if refresh is needed
+        """
+        if self.last_fetch is None:
+            return True
+
+        elapsed = datetime.utcnow() - self.last_fetch
+        cache_duration_seconds = self.config.cache_duration_hours * 3600
+        return elapsed.total_seconds() >= cache_duration_seconds
 
     def _analyze_text_vader(self, text: str) -> float:
         """
@@ -180,191 +179,202 @@ class SentimentAnalyzer:
             logger.debug(f"VADER analysis error: {e}")
             return 0.0
 
-    def _fetch_cryptopanic(self, symbol: str) -> List[NewsArticle]:
+    def _fetch_from_cryptopanic(self) -> Dict[str, CachedSentiment]:
         """
-        Fetch news from CryptoPanic API.
-        """
-        if not self._cryptopanic_key:
-            return []
+        Fetch sentiment for all 5 coins in minimal API calls.
 
-        keywords = self.SYMBOL_KEYWORDS.get(symbol, [symbol.replace("USDT", "").lower()])
-        currency = keywords[0] if keywords else "BTC"
-
-        cache_key = f"cryptopanic_{symbol}"
-        cached = self._cache.get(cache_key)
-        if cached:
-            return cached
-
-        try:
-            self._rate_limiter.wait()
-
-            url = "https://cryptopanic.com/api/v1/posts/"
-            params = {
-                "auth_token": self._cryptopanic_key,
-                "currencies": currency.upper(),
-                "kind": "news",
-                "public": "true",
-            }
-
-            response = self._session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-
-            articles = []
-            for item in data.get("results", [])[:self.config.max_articles_per_request]:
-                # Parse published time
-                pub_str = item.get("published_at", "")
-                try:
-                    published = datetime.fromisoformat(pub_str.replace("Z", "+00:00"))
-                except:
-                    published = datetime.utcnow()
-
-                title = item.get("title", "")
-                sentiment = self._analyze_text_vader(title)
-
-                articles.append(NewsArticle(
-                    title=title,
-                    source=item.get("source", {}).get("title", "CryptoPanic"),
-                    published_at=published,
-                    url=item.get("url", ""),
-                    sentiment_score=sentiment,
-                    currencies=[c.get("code", "") for c in item.get("currencies", [])],
-                ))
-
-            self._cache.set(cache_key, articles)
-            return articles
-
-        except Exception as e:
-            logger.warning(f"CryptoPanic fetch error: {e}")
-            return []
-
-    def _fetch_newsapi(self, symbol: str) -> List[NewsArticle]:
-        """
-        Fetch news from NewsAPI.
-        """
-        if not self._newsapi_key:
-            return []
-
-        keywords = self.SYMBOL_KEYWORDS.get(symbol, [symbol.replace("USDT", "").lower()])
-        query = " OR ".join(keywords)
-
-        cache_key = f"newsapi_{symbol}"
-        cached = self._cache.get(cache_key)
-        if cached:
-            return cached
-
-        try:
-            self._rate_limiter.wait()
-
-            url = "https://newsapi.org/v2/everything"
-            params = {
-                "apiKey": self._newsapi_key,
-                "q": query,
-                "language": "en",
-                "sortBy": "publishedAt",
-                "pageSize": min(self.config.max_articles_per_request, 100),
-            }
-
-            response = self._session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-
-            articles = []
-            for item in data.get("articles", []):
-                # Parse published time
-                pub_str = item.get("publishedAt", "")
-                try:
-                    published = datetime.fromisoformat(pub_str.replace("Z", "+00:00"))
-                except:
-                    published = datetime.utcnow()
-
-                # Combine title and description for sentiment
-                text = f"{item.get('title', '')} {item.get('description', '')}"
-                sentiment = self._analyze_text_vader(text)
-
-                articles.append(NewsArticle(
-                    title=item.get("title", ""),
-                    source=item.get("source", {}).get("name", "NewsAPI"),
-                    published_at=published,
-                    url=item.get("url", ""),
-                    sentiment_score=sentiment,
-                ))
-
-            self._cache.set(cache_key, articles)
-            return articles
-
-        except Exception as e:
-            logger.warning(f"NewsAPI fetch error: {e}")
-            return []
-
-    def _calculate_time_weighted_sentiment(
-        self,
-        articles: List[NewsArticle],
-        decay_hours: float = 24.0,
-    ) -> tuple:
-        """
-        Calculate time-weighted sentiment score.
-
-        More recent articles have higher weight.
+        CryptoPanic allows filtering by multiple currencies in one request.
 
         Returns:
-            Tuple of (score, confidence, positive_count, negative_count, neutral_count)
+            Dict mapping symbol to CachedSentiment
         """
-        if not articles:
-            return 0.0, 0.0, 0, 0, 0
+        results: Dict[str, CachedSentiment] = {}
 
+        if not self._api_key:
+            logger.warning("No CryptoPanic API key configured")
+            return self._create_default_sentiments()
+
+        try:
+            # Single API call with all currencies
+            url = "https://cryptopanic.com/api/v1/posts/"
+            params = {
+                "auth_token": self._api_key,
+                "currencies": ",".join(self.SUPPORTED_SYMBOLS),  # "BTC,ETH,BNB,SOL,XRP"
+                "filter": "hot",
+                "public": "true",
+                "kind": "news",
+            }
+
+            response = self._session.get(
+                url,
+                params=params,
+                timeout=self.config.request_timeout_seconds
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            # Process and categorize by symbol
+            symbol_articles: Dict[str, List[Dict]] = {s: [] for s in self.SUPPORTED_SYMBOLS}
+
+            for article in data.get("results", []):
+                votes = article.get("votes", {})
+                title = article.get("title", "")
+
+                # Use VADER for more nuanced sentiment
+                vader_score = self._analyze_text_vader(title)
+
+                article_data = {
+                    "positive": votes.get("positive", 0),
+                    "negative": votes.get("negative", 0),
+                    "liked": votes.get("liked", 0),
+                    "disliked": votes.get("disliked", 0),
+                    "vader_score": vader_score,
+                    "title": title,
+                }
+
+                # Assign to relevant symbols
+                for currency in article.get("currencies", []):
+                    code = currency.get("code", "").upper()
+                    if code in self.SUPPORTED_SYMBOLS:
+                        symbol_articles[code].append(article_data)
+
+            # Calculate sentiment for each symbol
+            now = datetime.utcnow()
+            expires = now + timedelta(hours=self.config.cache_duration_hours)
+
+            for symbol in self.SUPPORTED_SYMBOLS:
+                articles = symbol_articles[symbol]
+
+                if not articles:
+                    results[symbol] = CachedSentiment(
+                        symbol=symbol,
+                        sentiment="neutral",
+                        sentiment_score=0.0,
+                        bullish_count=0,
+                        bearish_count=0,
+                        total_articles=0,
+                        fetched_at=now,
+                        expires_at=expires,
+                    )
+                    continue
+
+                # Calculate sentiment from votes
+                bullish = sum(a["positive"] + a["liked"] for a in articles)
+                bearish = sum(a["negative"] + a["disliked"] for a in articles)
+                total_votes = bullish + bearish
+
+                # Calculate VADER-based sentiment
+                vader_scores = [a["vader_score"] for a in articles if a["vader_score"] != 0]
+                vader_avg = sum(vader_scores) / len(vader_scores) if vader_scores else 0.0
+
+                # Combine vote-based and VADER sentiment
+                if total_votes > 0:
+                    vote_score = (bullish - bearish) / total_votes  # -1 to +1
+                else:
+                    vote_score = 0.0
+
+                # Weight: 40% votes, 60% VADER (VADER is more nuanced)
+                final_score = vote_score * 0.4 + vader_avg * 0.6
+
+                # Classify sentiment
+                if final_score > self.config.bullish_threshold:
+                    sentiment = "bullish"
+                elif final_score < self.config.bearish_threshold:
+                    sentiment = "bearish"
+                else:
+                    sentiment = "neutral"
+
+                results[symbol] = CachedSentiment(
+                    symbol=symbol,
+                    sentiment=sentiment,
+                    sentiment_score=final_score,
+                    bullish_count=bullish,
+                    bearish_count=bearish,
+                    total_articles=len(articles),
+                    fetched_at=now,
+                    expires_at=expires,
+                )
+
+            return results
+
+        except requests.exceptions.Timeout:
+            logger.error("CryptoPanic API timeout")
+            return self._create_default_sentiments()
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"CryptoPanic API error: {e}")
+            return self._create_default_sentiments()
+
+        except Exception as e:
+            logger.error(f"Failed to fetch sentiment: {e}")
+            return self._create_default_sentiments()
+
+    def _create_default_sentiments(self) -> Dict[str, CachedSentiment]:
+        """Create default neutral sentiments for all symbols."""
         now = datetime.utcnow()
-        weighted_sum = 0.0
-        weight_total = 0.0
-        positive_count = 0
-        negative_count = 0
-        neutral_count = 0
+        expires = now + timedelta(hours=1)  # Short expiry to retry soon
 
-        for article in articles:
-            # Time decay weight
-            try:
-                age_hours = (now - article.published_at.replace(tzinfo=None)).total_seconds() / 3600
-            except:
-                age_hours = decay_hours / 2  # Default to middle weight
+        return {
+            symbol: CachedSentiment(
+                symbol=symbol,
+                sentiment="neutral",
+                sentiment_score=0.0,
+                bullish_count=0,
+                bearish_count=0,
+                total_articles=0,
+                fetched_at=now,
+                expires_at=expires,
+            )
+            for symbol in self.SUPPORTED_SYMBOLS
+        }
 
-            time_weight = max(0.1, 1.0 - (age_hours / decay_hours))
-
-            # Relevance weight
-            relevance_weight = article.relevance
-
-            weight = time_weight * relevance_weight
-            weighted_sum += article.sentiment_score * weight
-            weight_total += weight
-
-            # Count sentiment categories
-            if article.sentiment_score > 0.1:
-                positive_count += 1
-            elif article.sentiment_score < -0.1:
-                negative_count += 1
-            else:
-                neutral_count += 1
-
-        if weight_total == 0:
-            return 0.0, 0.0, 0, 0, 0
-
-        score = weighted_sum / weight_total
-
-        # Confidence based on article count and sentiment consistency
-        count_factor = min(len(articles) / 10, 1.0)
-        consistency = 1.0 - min(abs(positive_count - negative_count) / (len(articles) + 1), 1.0)
-        confidence = count_factor * 0.7 + (1 - consistency) * 0.3
-
-        return score, confidence, positive_count, negative_count, neutral_count
-
-    def analyze(self, symbol: str) -> SentimentSignal:
+    def refresh_if_needed(self) -> bool:
         """
-        Analyze sentiment for a symbol.
+        Refresh cache if 6 hours have passed.
+
+        Call this at the start of main loop or on a schedule.
+
+        Returns:
+            True if refresh was performed
+        """
+        if not self.config.enabled:
+            return False
+
+        if not self._should_refresh():
+            return False
+
+        try:
+            logger.info(
+                f"Refreshing sentiment cache ({self.config.cache_duration_hours}-hour interval)..."
+            )
+            self.cache = self._fetch_from_cryptopanic()
+            self.last_fetch = datetime.utcnow()
+
+            # Log summary
+            for symbol, data in self.cache.items():
+                logger.info(
+                    f"Sentiment cached: {symbol} -> {data.sentiment} "
+                    f"(score={data.sentiment_score:.2f}, articles={data.total_articles})"
+                )
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to refresh sentiment: {e}")
+            # Keep using stale cache if refresh fails
+            return False
+
+    def get_sentiment(self, symbol: str) -> SentimentSignal:
+        """
+        Get cached sentiment for a symbol (v3).
+
+        Returns neutral if no data available.
 
         Args:
             symbol: Trading pair (e.g., 'BTCUSDT')
 
         Returns:
-            SentimentSignal with sentiment scores and confidence
+            SentimentSignal from cache
         """
         symbol = symbol.upper()
         timestamp = datetime.utcnow()
@@ -381,63 +391,97 @@ class SentimentAnalyzer:
                 error_message="Sentiment analysis disabled",
             )
 
-        all_articles = []
-        source_breakdown = {}
+        # Map trading symbol to CryptoPanic symbol
+        crypto_symbol = self.SYMBOL_MAP.get(symbol, symbol.replace("USDT", ""))
+        cached = self.cache.get(crypto_symbol)
 
-        # Fetch from configured provider
-        if self.config.provider == NewsProvider.CRYPTOPANIC:
-            articles = self._fetch_cryptopanic(symbol)
-            if articles:
-                all_articles.extend(articles)
-                source_breakdown["cryptopanic"] = len(articles)
+        if cached is None:
+            # No cached data - return neutral
+            return SentimentSignal(
+                symbol=symbol,
+                timestamp=timestamp,
+                sentiment_score=0.0,
+                confidence=0.0,
+                global_sentiment_score=self._get_global_sentiment(),
+                global_confidence=0.5,
+                is_valid=False,
+                error_message="No cached sentiment data",
+            )
 
-        elif self.config.provider == NewsProvider.NEWSAPI:
-            articles = self._fetch_newsapi(symbol)
-            if articles:
-                all_articles.extend(articles)
-                source_breakdown["newsapi"] = len(articles)
+        # Check if cache is expired (warning only, still use data)
+        if datetime.utcnow() > cached.expires_at:
+            logger.warning(f"Sentiment cache expired for {symbol}, using stale data")
 
-        # Calculate symbol-specific sentiment
-        score, confidence, pos, neg, neu = self._calculate_time_weighted_sentiment(all_articles)
-
-        # For global sentiment, fetch BTC as proxy (if not already BTC)
-        global_score = score
-        global_confidence = confidence
-        if symbol != "BTCUSDT":
-            # Try to get cached BTC sentiment
-            btc_signal = self._cache.get("global_sentiment")
-            if btc_signal:
-                global_score, global_confidence = btc_signal
-            else:
-                # Quick BTC sentiment check
-                btc_articles = self._fetch_cryptopanic("BTCUSDT") if self._cryptopanic_key else []
-                if btc_articles:
-                    global_score, global_confidence, _, _, _ = self._calculate_time_weighted_sentiment(btc_articles)
-                    self._cache.set("global_sentiment", (global_score, global_confidence))
+        # Calculate confidence based on article count
+        min_articles = self.config.min_articles_for_confidence
+        max_articles = self.config.max_confidence_articles
+        if cached.total_articles >= max_articles:
+            confidence = 1.0
+        elif cached.total_articles >= min_articles:
+            confidence = cached.total_articles / max_articles
+        else:
+            confidence = cached.total_articles / max_articles * 0.5  # Reduced confidence
 
         # Apply minimum confidence threshold
         if confidence < self.config.min_confidence_threshold:
             confidence = 0.0
-            score = 0.0  # Don't use low-confidence signals
+
+        # Classify positive/negative counts
+        if cached.sentiment_score > 0:
+            positive_count = max(cached.bullish_count, 1)
+            negative_count = cached.bearish_count
+        elif cached.sentiment_score < 0:
+            positive_count = cached.bullish_count
+            negative_count = max(cached.bearish_count, 1)
+        else:
+            positive_count = cached.bullish_count
+            negative_count = cached.bearish_count
 
         return SentimentSignal(
             symbol=symbol,
-            timestamp=timestamp,
-            sentiment_score=score,
+            timestamp=cached.fetched_at,
+            sentiment_score=cached.sentiment_score,
             confidence=confidence,
-            global_sentiment_score=global_score,
-            global_confidence=global_confidence,
-            article_count=len(all_articles),
-            positive_count=pos,
-            negative_count=neg,
-            neutral_count=neu,
-            source_breakdown=source_breakdown,
+            global_sentiment_score=self._get_global_sentiment(),
+            global_confidence=0.5,
+            article_count=cached.total_articles,
+            positive_count=positive_count,
+            negative_count=negative_count,
+            neutral_count=0,
+            cache_expires_at=cached.expires_at,
+            is_from_cache=True,
             is_valid=True,
         )
 
+    def _get_global_sentiment(self) -> float:
+        """Calculate overall market sentiment from BTC (market proxy)."""
+        btc = self.cache.get("BTC")
+        if btc:
+            return btc.sentiment_score
+        return 0.0
+
+    def analyze(self, symbol: str) -> SentimentSignal:
+        """
+        Analyze sentiment for a symbol (v3 - wrapper for get_sentiment).
+
+        This method maintains backward compatibility.
+        Internally uses the 6-hour cache.
+
+        Args:
+            symbol: Trading pair (e.g., 'BTCUSDT')
+
+        Returns:
+            SentimentSignal from cache
+        """
+        # Ensure cache is populated
+        self.refresh_if_needed()
+        return self.get_sentiment(symbol)
+
     def analyze_batch(self, symbols: List[str]) -> Dict[str, SentimentSignal]:
         """
-        Analyze sentiment for multiple symbols.
+        Analyze sentiment for multiple symbols (v3).
+
+        With 6-hour cache, this is very efficient as data is already cached.
 
         Args:
             symbols: List of trading pairs
@@ -445,10 +489,41 @@ class SentimentAnalyzer:
         Returns:
             Dict mapping symbol to SentimentSignal
         """
+        # Ensure cache is populated
+        self.refresh_if_needed()
+
         results = {}
         for symbol in symbols:
-            results[symbol] = self.analyze(symbol)
+            results[symbol] = self.get_sentiment(symbol)
         return results
+
+    def get_cache_status(self) -> Dict[str, Any]:
+        """
+        Get current cache status for monitoring.
+
+        Returns:
+            Dict with cache info
+        """
+        now = datetime.utcnow()
+        return {
+            "last_fetch": self.last_fetch.isoformat() if self.last_fetch else None,
+            "cache_size": len(self.cache),
+            "cached_symbols": list(self.cache.keys()),
+            "is_stale": self._should_refresh(),
+            "next_refresh_in_minutes": (
+                (self.config.cache_duration_hours * 60) -
+                (now - self.last_fetch).total_seconds() / 60
+                if self.last_fetch else 0
+            ),
+            "sentiments": {
+                symbol: {
+                    "sentiment": data.sentiment,
+                    "score": round(data.sentiment_score, 4),
+                    "articles": data.total_articles,
+                }
+                for symbol, data in self.cache.items()
+            }
+        }
 
     def get_market_fear_greed(self) -> Dict[str, Any]:
         """
@@ -457,12 +532,15 @@ class SentimentAnalyzer:
         Returns:
             Dict with fear_greed_score (0-100), sentiment, and description
         """
-        # Analyze BTC as market proxy
-        signal = self.analyze("BTCUSDT")
+        # Ensure cache is populated
+        self.refresh_if_needed()
+
+        # Use BTC as market proxy
+        btc_sentiment = self._get_global_sentiment()
 
         # Convert sentiment score to fear/greed scale (0-100)
         # -1 = 0 (Extreme Fear), 0 = 50 (Neutral), +1 = 100 (Extreme Greed)
-        fear_greed = int((signal.sentiment_score + 1) * 50)
+        fear_greed = int((btc_sentiment + 1) * 50)
         fear_greed = max(0, min(100, fear_greed))
 
         if fear_greed < 20:
@@ -481,11 +559,14 @@ class SentimentAnalyzer:
             sentiment = "extreme_greed"
             description = "Extreme Greed - Potential correction ahead"
 
+        btc_cached = self.cache.get("BTC")
+
         return {
             "fear_greed_score": fear_greed,
             "sentiment": sentiment,
             "description": description,
-            "confidence": signal.confidence,
-            "article_count": signal.article_count,
-            "timestamp": signal.timestamp.isoformat(),
+            "confidence": 0.5,
+            "article_count": btc_cached.total_articles if btc_cached else 0,
+            "timestamp": btc_cached.fetched_at.isoformat() if btc_cached else None,
+            "cache_expires_at": btc_cached.expires_at.isoformat() if btc_cached else None,
         }

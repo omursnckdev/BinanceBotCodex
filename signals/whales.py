@@ -1,7 +1,9 @@
 """
-Whale activity detection module.
+Whale activity detection module (v3).
 Detects large trades and order book imbalances.
 Provides explicit defensive actions (NOT FLAT signals).
+
+v3: Added offensive whale entry signals for momentum trading.
 """
 
 from __future__ import annotations
@@ -25,10 +27,12 @@ logger = get_logger(__name__)
 @dataclass
 class WhaleSignal:
     """
-    Whale activity signal output.
+    Whale activity signal output (v3).
 
     IMPORTANT: This module does NOT output FLAT to trigger closes.
     It outputs explicit defensive actions via recommended_action.
+
+    v3: Added whale_entry_signal for offensive trading based on whale activity.
     """
     symbol: str
     timestamp: datetime
@@ -40,6 +44,10 @@ class WhaleSignal:
     # Alert flags - CRITICAL: whale_alert_opposite triggers defensive action
     whale_alert_opposite: bool  # True if whale activity is against your position
     recommended_action: WhaleDefensiveAction  # Explicit action to take
+
+    # v3 NEW: Entry signals from whale activity (offensive trading)
+    whale_entry_signal: Optional[str] = None  # "LONG", "SHORT", or None
+    whale_entry_confidence: float = 0.0  # 0 to 1 - confidence in entry signal
 
     # Detection details
     large_buy_count: int = 0
@@ -61,6 +69,8 @@ class WhaleSignal:
             "whale_confidence": round(self.whale_confidence, 4),
             "whale_alert_opposite": self.whale_alert_opposite,
             "recommended_action": self.recommended_action.value,
+            "whale_entry_signal": self.whale_entry_signal,
+            "whale_entry_confidence": round(self.whale_entry_confidence, 4),
             "large_buy_count": self.large_buy_count,
             "large_sell_count": self.large_sell_count,
             "orderbook_imbalance": round(self.orderbook_imbalance, 4),
@@ -213,6 +223,126 @@ class WhaleDetector:
         # Spike if change exceeds threshold
         return change >= self.config.imbalance_threshold
 
+    def _detect_whale_entry_signal(
+        self,
+        symbol: str,
+        buy_volume: float,
+        sell_volume: float,
+        large_buy_count: int,
+        large_sell_count: int,
+        orderbook_imbalance: float,
+    ) -> tuple[Optional[str], float]:
+        """
+        Detect whale entry signals (v3 offensive trading).
+
+        Use whale activity as ENTRY signal, not just defensive.
+
+        Args:
+            symbol: Trading pair
+            buy_volume: Total large buy volume
+            sell_volume: Total large sell volume
+            large_buy_count: Number of large buy trades
+            large_sell_count: Number of large sell trades
+            orderbook_imbalance: Current orderbook imbalance
+
+        Returns:
+            Tuple of (signal: "LONG"/"SHORT"/None, confidence: 0-1)
+        """
+        if not self.config.entry_signal_enabled:
+            return None, 0.0
+
+        total_volume = buy_volume + sell_volume
+        total_large_trades = large_buy_count + large_sell_count
+
+        if total_volume == 0:
+            return None, 0.0
+
+        # Calculate volume imbalance
+        imbalance = (buy_volume - sell_volume) / total_volume
+
+        # Get thresholds from config
+        imbalance_threshold = self.config.entry_imbalance_threshold
+        strong_imbalance_threshold = self.config.entry_strong_imbalance_threshold
+        min_large_trades = self.config.entry_min_large_trades
+
+        # Check for LONG entry signal (whale buying)
+        if imbalance > 0:
+            # Very strong whale buying - 3:1 buy:sell ratio with high imbalance
+            if imbalance >= strong_imbalance_threshold and buy_volume > sell_volume * 3:
+                confidence = 0.95
+                logger.info(
+                    f"Whale LONG entry signal (very strong)",
+                    extra={
+                        "symbol": symbol,
+                        "imbalance": round(imbalance, 4),
+                        "buy_volume": buy_volume,
+                        "sell_volume": sell_volume,
+                        "confidence": confidence,
+                    }
+                )
+                return "LONG", confidence
+
+            # Strong whale buying - significant imbalance with multiple large trades
+            if imbalance >= imbalance_threshold and large_buy_count >= min_large_trades:
+                confidence = min(0.9, 0.5 + imbalance * 0.5)
+
+                # Boost confidence if orderbook supports
+                if orderbook_imbalance > 0.3:
+                    confidence = min(0.95, confidence + 0.1)
+
+                if confidence >= self.config.entry_min_confidence:
+                    logger.info(
+                        f"Whale LONG entry signal",
+                        extra={
+                            "symbol": symbol,
+                            "imbalance": round(imbalance, 4),
+                            "large_buys": large_buy_count,
+                            "confidence": round(confidence, 4),
+                        }
+                    )
+                    return "LONG", confidence
+
+        # Check for SHORT entry signal (whale selling)
+        elif imbalance < 0:
+            abs_imbalance = abs(imbalance)
+
+            # Very strong whale selling - 3:1 sell:buy ratio with high imbalance
+            if abs_imbalance >= strong_imbalance_threshold and sell_volume > buy_volume * 3:
+                confidence = 0.95
+                logger.info(
+                    f"Whale SHORT entry signal (very strong)",
+                    extra={
+                        "symbol": symbol,
+                        "imbalance": round(imbalance, 4),
+                        "buy_volume": buy_volume,
+                        "sell_volume": sell_volume,
+                        "confidence": confidence,
+                    }
+                )
+                return "SHORT", confidence
+
+            # Strong whale selling - significant imbalance with multiple large trades
+            if abs_imbalance >= imbalance_threshold and large_sell_count >= min_large_trades:
+                confidence = min(0.9, 0.5 + abs_imbalance * 0.5)
+
+                # Boost confidence if orderbook supports
+                if orderbook_imbalance < -0.3:
+                    confidence = min(0.95, confidence + 0.1)
+
+                if confidence >= self.config.entry_min_confidence:
+                    logger.info(
+                        f"Whale SHORT entry signal",
+                        extra={
+                            "symbol": symbol,
+                            "imbalance": round(imbalance, 4),
+                            "large_sells": large_sell_count,
+                            "confidence": round(confidence, 4),
+                        }
+                    )
+                    return "SHORT", confidence
+
+        return None, 0.0
+
     def _is_alert_cooldown(self, symbol: str) -> bool:
         """Check if we're in alert cooldown period."""
         if symbol not in self._last_alert_time:
@@ -227,7 +357,7 @@ class WhaleDetector:
         position_side: Optional[str] = None,  # 'LONG', 'SHORT', or None
     ) -> WhaleSignal:
         """
-        Analyze whale activity for a symbol.
+        Analyze whale activity for a symbol (v3).
 
         Args:
             symbol: Trading pair
@@ -235,6 +365,7 @@ class WhaleDetector:
 
         Returns:
             WhaleSignal with explicit defensive action if needed
+            v3: Also includes whale_entry_signal for offensive trading
 
         IMPORTANT: This method outputs recommended_action for defensive measures.
         It does NOT output FLAT to trigger position closes.
@@ -288,7 +419,17 @@ class WhaleDetector:
         whale_confidence = (trade_count_factor * 0.6 + imbalance_factor * 0.4)
         whale_confidence = np.clip(whale_confidence, 0, 1)
 
-        # 5. Determine if whale activity is opposite to position
+        # 5. v3 NEW: Detect whale entry signals (offensive trading)
+        whale_entry_signal, whale_entry_confidence = self._detect_whale_entry_signal(
+            symbol=symbol,
+            buy_volume=buy_volume,
+            sell_volume=sell_volume,
+            large_buy_count=large_buy_count,
+            large_sell_count=large_sell_count,
+            orderbook_imbalance=imbalance,
+        )
+
+        # 6. Determine if whale activity is opposite to position
         whale_alert_opposite = False
         recommended_action = WhaleDefensiveAction.NONE
         detection_reason = ""
@@ -313,7 +454,7 @@ class WhaleDetector:
                     whale_alert_opposite = True
                     detection_reason = f"Order book imbalance spike (buy pressure) against SHORT position"
 
-            # 6. Determine defensive action (EXPLICIT, NOT FLAT)
+            # 7. Determine defensive action (EXPLICIT, NOT FLAT)
             if whale_alert_opposite:
                 self._last_alert_time[symbol] = timestamp
 
@@ -344,6 +485,8 @@ class WhaleDetector:
             whale_confidence=whale_confidence,
             whale_alert_opposite=whale_alert_opposite,
             recommended_action=recommended_action,
+            whale_entry_signal=whale_entry_signal,  # v3: Entry signal
+            whale_entry_confidence=whale_entry_confidence,  # v3: Entry confidence
             large_buy_count=large_buy_count,
             large_sell_count=large_sell_count,
             large_buy_volume=buy_volume,

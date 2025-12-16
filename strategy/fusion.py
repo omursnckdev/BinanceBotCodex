@@ -1,6 +1,12 @@
 """
-Fusion strategy module.
+Fusion strategy module (v3).
 Combines technical, whale, and sentiment signals into trading decisions.
+
+v3 Features:
+- Dynamic weight adjustments based on signal strength
+- RSI extreme override capability
+- Whale entry signal integration
+- Trailing stop state tracking
 
 IMPORTANT:
 - FLAT means "NO NEW ENTRY" - it does NOT mean close position
@@ -18,7 +24,7 @@ import numpy as np
 
 from config import (
     FusionConfig, SymbolConfig, TradingAction, Trend,
-    WhaleDefensiveAction, get_settings
+    WhaleDefensiveAction, RSIExtremeDirection, get_settings
 )
 from signals.indicators import TechnicalSignal
 from signals.whales import WhaleSignal
@@ -32,12 +38,16 @@ logger = get_logger(__name__)
 @dataclass
 class FusionDecision:
     """
-    Combined trading decision from all signals.
+    Combined trading decision from all signals (v3).
 
     IMPORTANT:
     - action=FLAT means "do not enter new position" - NOT close position
     - For exits, use exit_reason field
     - Whale defensive actions are in recommended_defensive_action
+
+    v3 additions:
+    - trailing_stop_active: Whether trailing stop is recommended
+    - override_reason: If entry was triggered by RSI extreme or whale signal
     """
     symbol: str
     timestamp: datetime
@@ -57,6 +67,10 @@ class FusionDecision:
     recommended_defensive_action: Optional[WhaleDefensiveAction] = None
     exit_reason: Optional[str] = None  # If set, suggests closing position
 
+    # v3: Trailing stop
+    trailing_stop_active: bool = True  # Default enabled for scalping
+    current_trailing_stop: Optional[float] = None
+
     # Signal components
     tech_score: float = 0.0
     tech_confidence: float = 0.0
@@ -64,6 +78,11 @@ class FusionDecision:
     whale_confidence: float = 0.0
     sentiment_score: float = 0.0
     sentiment_confidence: float = 0.0
+
+    # v3: Override info
+    override_reason: Optional[str] = None  # RSI extreme or whale entry override
+    rsi_extreme: bool = False
+    whale_entry_signal: Optional[str] = None
 
     # Context
     trend: Trend = Trend.NEUTRAL
@@ -86,11 +105,15 @@ class FusionDecision:
             "leverage": self.leverage,
             "stop_loss_pct": round(self.stop_loss_pct, 4),
             "take_profit_pct": round(self.take_profit_pct, 4),
+            "trailing_stop_active": self.trailing_stop_active,
             "defensive_action": self.recommended_defensive_action.value if self.recommended_defensive_action else None,
             "exit_reason": self.exit_reason,
+            "override_reason": self.override_reason,
             "tech_score": round(self.tech_score, 4),
             "whale_score": round(self.whale_score, 4),
             "sentiment_score": round(self.sentiment_score, 4),
+            "rsi_extreme": self.rsi_extreme,
+            "whale_entry_signal": self.whale_entry_signal,
             "trend": self.trend.value,
             "decision_reason": self.decision_reason,
         }
@@ -98,18 +121,127 @@ class FusionDecision:
 
 class FusionStrategy:
     """
-    Combines multiple signal sources into trading decisions.
+    Combines multiple signal sources into trading decisions (v3).
 
     Key Design Principles:
     1. FLAT means "no new entry" - NEVER means close position
     2. Exits are explicit via exit_reason
     3. Whale defensive actions are explicit via recommended_defensive_action
     4. Scalping profile with tight TP/SL targets
+
+    v3 Enhancements:
+    - Dynamic weight adjustment based on signal strength
+    - RSI extreme can override low fusion scores
+    - Whale entry signals can trigger entries
+    - Trailing stop recommendations included
     """
 
     def __init__(self, config: Optional[FusionConfig] = None):
         self.config = config or get_settings().fusion
         self.settings = get_settings()
+
+    def _calculate_dynamic_weights(
+        self,
+        tech_signal: TechnicalSignal,
+        whale_signal: WhaleSignal,
+        base_weights: Dict[str, float],
+    ) -> Dict[str, float]:
+        """
+        Calculate dynamic weights based on signal strength (v3).
+
+        Adjusts weights when:
+        - RSI shows extreme values (boost tech weight)
+        - Whale has strong entry signal (boost whale weight)
+
+        Args:
+            tech_signal: Technical analysis signal
+            whale_signal: Whale activity signal
+            base_weights: Base weight configuration
+
+        Returns:
+            Dict with adjusted weights
+        """
+        tech_weight = base_weights["tech"]
+        whale_weight = base_weights["whale"]
+        sentiment_weight = base_weights["sentiment"]
+
+        # Boost whale weight if strong entry signal
+        if whale_signal.whale_entry_confidence >= 0.7:
+            whale_weight = self.config.whale_strong_signal_weight_boost
+            tech_weight = (1.0 - whale_weight) * 0.7
+            sentiment_weight = (1.0 - whale_weight) * 0.3
+            logger.debug(
+                f"Weight boost: whale entry signal (conf={whale_signal.whale_entry_confidence:.2f})"
+            )
+
+        # Boost tech weight if RSI extreme
+        if tech_signal.rsi_extreme:
+            tech_weight = self.config.rsi_extreme_weight_boost
+            whale_weight = (1.0 - tech_weight) * 0.6
+            sentiment_weight = (1.0 - tech_weight) * 0.4
+            logger.debug(
+                f"Weight boost: RSI extreme ({tech_signal.rsi_extreme_direction.value})"
+            )
+
+        # Normalize
+        total = tech_weight + whale_weight + sentiment_weight
+        if total > 0:
+            tech_weight /= total
+            whale_weight /= total
+            sentiment_weight /= total
+
+        return {
+            "tech": tech_weight,
+            "whale": whale_weight,
+            "sentiment": sentiment_weight,
+        }
+
+    def _check_override_conditions(
+        self,
+        tech_signal: TechnicalSignal,
+        whale_signal: WhaleSignal,
+        final_score: float,
+    ) -> tuple[Optional[TradingAction], Optional[str]]:
+        """
+        Check if RSI extreme or whale entry should override the fusion decision (v3).
+
+        Returns:
+            Tuple of (override_action, override_reason) or (None, None)
+        """
+        indicator_config = self.settings.indicators
+
+        # RSI extreme override (if enabled)
+        if indicator_config.rsi_extreme_override_enabled and tech_signal.rsi_extreme:
+            if tech_signal.rsi_extreme_confidence >= self.config.rsi_extreme_override_confidence:
+                if tech_signal.rsi_extreme_direction == RSIExtremeDirection.OVERSOLD:
+                    logger.info(
+                        f"RSI extreme override: LONG (RSI={tech_signal.rsi:.1f}, "
+                        f"conf={tech_signal.rsi_extreme_confidence:.2f})"
+                    )
+                    return TradingAction.LONG, f"RSI extreme oversold override (RSI={tech_signal.rsi:.1f})"
+
+                elif tech_signal.rsi_extreme_direction == RSIExtremeDirection.OVERBOUGHT:
+                    logger.info(
+                        f"RSI extreme override: SHORT (RSI={tech_signal.rsi:.1f}, "
+                        f"conf={tech_signal.rsi_extreme_confidence:.2f})"
+                    )
+                    return TradingAction.SHORT, f"RSI extreme overbought override (RSI={tech_signal.rsi:.1f})"
+
+        # Whale entry signal override
+        if whale_signal.whale_entry_signal and whale_signal.whale_entry_confidence >= self.config.whale_entry_override_confidence:
+            if whale_signal.whale_entry_signal == "LONG":
+                logger.info(
+                    f"Whale entry override: LONG (conf={whale_signal.whale_entry_confidence:.2f})"
+                )
+                return TradingAction.LONG, f"Strong whale buying signal override (conf={whale_signal.whale_entry_confidence:.2f})"
+
+            elif whale_signal.whale_entry_signal == "SHORT":
+                logger.info(
+                    f"Whale entry override: SHORT (conf={whale_signal.whale_entry_confidence:.2f})"
+                )
+                return TradingAction.SHORT, f"Strong whale selling signal override (conf={whale_signal.whale_entry_confidence:.2f})"
+
+        return None, None
 
     def fuse_signals(
         self,
@@ -121,7 +253,7 @@ class FusionStrategy:
         market_conditions_ok: bool = True,
     ) -> FusionDecision:
         """
-        Combine all signals into a trading decision.
+        Combine all signals into a trading decision (v3).
 
         Args:
             symbol: Trading pair
@@ -138,26 +270,25 @@ class FusionStrategy:
         - action=FLAT means "do not enter" - NOT close
         - Check recommended_defensive_action for position protection
         - Check exit_reason for explicit exit signals
+        - v3: Check override_reason for RSI/whale overrides
         """
         symbol = symbol.upper()
         timestamp = datetime.utcnow()
         symbol_config = self.settings.get_symbol_config(symbol)
 
-        # Get weights
-        tech_weight = symbol_config.tech_weight
-        whale_weight = symbol_config.whale_weight
-        sentiment_weight = symbol_config.sentiment_weight
+        # Get base weights
+        base_weights = {
+            "tech": self.config.default_tech_weight,
+            "whale": self.config.default_whale_weight,
+            "sentiment": self.config.default_sentiment_weight,
+        }
 
-        # Normalize weights
-        total_weight = tech_weight + whale_weight + sentiment_weight
-        if total_weight > 0:
-            tech_weight /= total_weight
-            whale_weight /= total_weight
-            sentiment_weight /= total_weight
-        else:
-            tech_weight = 1.0
-            whale_weight = 0.0
-            sentiment_weight = 0.0
+        # v3: Calculate dynamic weights
+        weights = self._calculate_dynamic_weights(tech_signal, whale_signal, base_weights)
+
+        tech_weight = weights["tech"]
+        whale_weight = weights["whale"]
+        sentiment_weight = weights["sentiment"]
 
         skip_reasons = []
 
@@ -201,17 +332,30 @@ class FusionStrategy:
         # Determine action
         action = TradingAction.FLAT  # Default: no new entry
         decision_reason = ""
+        override_reason = None
+
+        # v3: Check for RSI extreme or whale entry override
+        override_action, override_msg = self._check_override_conditions(
+            tech_signal, whale_signal, final_score
+        )
+
+        if override_action and not skip_reasons:
+            action = override_action
+            override_reason = override_msg
+            decision_reason = override_msg
+            # Boost confidence for overrides
+            confidence = max(confidence, 0.75)
 
         # Check if we should skip
-        if skip_reasons:
+        elif skip_reasons:
             decision_reason = f"Skip: {'; '.join(skip_reasons)}"
 
-        # Check minimum score threshold
+        # Check minimum score threshold (v3: increased to 0.4)
         elif abs(final_score) < self.config.entry_threshold:
             decision_reason = f"Score {final_score:.3f} below threshold {self.config.entry_threshold}"
             skip_reasons.append("Score below threshold")
 
-        # Check minimum confidence
+        # Check minimum confidence (v3: increased to 0.45)
         elif confidence < self.config.min_confidence_for_entry:
             decision_reason = f"Confidence {confidence:.3f} below minimum {self.config.min_confidence_for_entry}"
             skip_reasons.append("Confidence too low")
@@ -223,12 +367,16 @@ class FusionStrategy:
             if final_score > 0:
                 # Bullish signal
                 if self.config.require_trend_confirmation:
+                    # v3: RSI extreme can bypass trend requirement
                     if tech_signal.trend == Trend.BULLISH:
                         action = TradingAction.LONG
                         decision_reason = "Bullish signal with trend confirmation"
                     elif tech_signal.trend == Trend.NEUTRAL and is_high_confidence:
                         action = TradingAction.LONG
                         decision_reason = "Bullish signal with high confidence (neutral trend)"
+                    elif tech_signal.rsi_extreme and tech_signal.rsi_extreme_direction == RSIExtremeDirection.OVERSOLD:
+                        action = TradingAction.LONG
+                        decision_reason = f"Bullish signal with RSI extreme oversold (RSI={tech_signal.rsi:.1f})"
                     elif self.config.allow_counter_trend_high_confidence and is_high_confidence:
                         action = TradingAction.LONG
                         decision_reason = "Bullish signal with very high confidence (counter-trend)"
@@ -242,12 +390,16 @@ class FusionStrategy:
             elif final_score < 0:
                 # Bearish signal
                 if self.config.require_trend_confirmation:
+                    # v3: RSI extreme can bypass trend requirement
                     if tech_signal.trend == Trend.BEARISH:
                         action = TradingAction.SHORT
                         decision_reason = "Bearish signal with trend confirmation"
                     elif tech_signal.trend == Trend.NEUTRAL and is_high_confidence:
                         action = TradingAction.SHORT
                         decision_reason = "Bearish signal with high confidence (neutral trend)"
+                    elif tech_signal.rsi_extreme and tech_signal.rsi_extreme_direction == RSIExtremeDirection.OVERBOUGHT:
+                        action = TradingAction.SHORT
+                        decision_reason = f"Bearish signal with RSI extreme overbought (RSI={tech_signal.rsi:.1f})"
                     elif self.config.allow_counter_trend_high_confidence and is_high_confidence:
                         action = TradingAction.SHORT
                         decision_reason = "Bearish signal with very high confidence (counter-trend)"
@@ -265,29 +417,46 @@ class FusionStrategy:
         position_size_pct = 0.0
 
         if action != TradingAction.FLAT:
-            # Dynamic leverage based on confidence (scalping: conservative)
+            # v3: Dynamic leverage based on confidence and RSI extreme
             risk_config = self.settings.risk
             max_leverage = min(symbol_config.leverage, risk_config.max_leverage)
             min_leverage = risk_config.min_leverage
 
-            leverage = min_leverage + int((max_leverage - min_leverage) * confidence)
+            # RSI extreme = higher confidence in direction
+            if tech_signal.rsi_extreme and confidence > 0.7:
+                leverage = max_leverage
+            elif confidence >= 0.85:
+                leverage = max_leverage
+            elif confidence >= 0.70:
+                leverage = min(max_leverage, 4)
+            elif confidence >= 0.55:
+                leverage = min(max_leverage, 3)
+            else:
+                leverage = min_leverage
+
             leverage = max(min_leverage, min(leverage, max_leverage))
 
-            # ATR-based stop loss (clamped to scalping bounds)
+            # v3: Tighter ATR-based stop loss for scalping
             atr_stop = tech_signal.atr_pct * risk_config.sl_atr_multiplier
             stop_loss_pct = max(
                 risk_config.sl_min_pct,
                 min(atr_stop, risk_config.sl_max_pct)
             )
 
-            # Take profit based on risk-reward ratio
+            # v3: Take profit based on tighter risk-reward ratio
             take_profit_pct = max(
                 stop_loss_pct * risk_config.min_risk_reward_ratio,
-                symbol_config.take_profit_pct
+                risk_config.tp_default_pct
             )
+
+            # Cap take profit
+            take_profit_pct = min(take_profit_pct, risk_config.tp_max_pct)
 
             # Position size based on risk per trade
             position_size_pct = symbol_config.risk_per_trade_pct
+
+        # v3: Trailing stop is always active for scalping
+        trailing_stop_active = action != TradingAction.FLAT and self.settings.risk.trailing.enabled
 
         return FusionDecision(
             symbol=symbol,
@@ -301,12 +470,16 @@ class FusionStrategy:
             take_profit_pct=take_profit_pct,
             recommended_defensive_action=recommended_defensive,
             exit_reason=exit_reason,
+            trailing_stop_active=trailing_stop_active,
             tech_score=tech_signal.tech_score,
             tech_confidence=tech_signal.tech_confidence,
             whale_score=whale_signal.whale_score,
             whale_confidence=whale_signal.whale_confidence,
             sentiment_score=sentiment_signal.sentiment_score,
             sentiment_confidence=sentiment_signal.confidence,
+            override_reason=override_reason,
+            rsi_extreme=tech_signal.rsi_extreme,
+            whale_entry_signal=whale_signal.whale_entry_signal,
             trend=tech_signal.trend,
             atr_pct=tech_signal.atr_pct,
             decision_reason=decision_reason,
@@ -321,9 +494,10 @@ class FusionStrategy:
         position_entry_time: datetime,
         position_entry_price: float,
         current_price: float,
+        current_pnl_pct: float = 0.0,
     ) -> tuple:
         """
-        Check if position should be closed based on decision.
+        Check if position should be closed based on decision (v3).
 
         Returns:
             Tuple of (should_close: bool, reason: str)
@@ -338,10 +512,20 @@ class FusionStrategy:
         if decision.recommended_defensive_action == WhaleDefensiveAction.CLOSE_MARKET:
             return True, "Whale defensive action: CLOSE_MARKET"
 
-        # Check time-stop
+        # v3: Graduated time-stop based on PnL
         risk_config = self.settings.risk
         position_age_minutes = (datetime.utcnow() - position_entry_time).total_seconds() / 60
-        if position_age_minutes >= risk_config.time_stop_minutes:
+
+        # If profitable, allow more time
+        if current_pnl_pct > 0.3:
+            if position_age_minutes >= risk_config.time_stop_profitable_minutes:
+                return True, f"Time-stop (profitable): Position open for {position_age_minutes:.0f} minutes"
+        # If slightly negative, exit faster
+        elif current_pnl_pct < -0.1:
+            if position_age_minutes >= risk_config.time_stop_losing_minutes:
+                return True, f"Time-stop (losing): Position open for {position_age_minutes:.0f} minutes"
+        # Default time stop
+        elif position_age_minutes >= risk_config.time_stop_minutes:
             return True, f"Time-stop: Position open for {position_age_minutes:.0f} minutes"
 
         # Check for strong opposite signal
@@ -352,6 +536,13 @@ class FusionStrategy:
         elif position_side == "SHORT" and decision.action == TradingAction.LONG:
             if decision.confidence >= self.config.high_confidence_threshold:
                 return True, "Strong opposite signal (LONG) while in SHORT"
+
+        # v3: Check RSI extreme in opposite direction
+        if decision.rsi_extreme:
+            if position_side == "LONG" and decision.override_reason and "overbought" in decision.override_reason.lower():
+                return True, f"RSI extreme overbought while in LONG (RSI signal)"
+            elif position_side == "SHORT" and decision.override_reason and "oversold" in decision.override_reason.lower():
+                return True, f"RSI extreme oversold while in SHORT (RSI signal)"
 
         return False, ""
 
@@ -364,7 +555,7 @@ class FusionStrategy:
         current_price: float,
     ) -> float:
         """
-        Calculate position size based on risk management.
+        Calculate position size based on risk management (v3).
 
         Args:
             balance: Account balance in USDT
@@ -375,6 +566,8 @@ class FusionStrategy:
 
         Returns:
             Position size in base asset units
+
+        v3: Updated for tighter scalping parameters
         """
         if stop_loss_pct <= 0 or current_price <= 0:
             return 0.0
@@ -383,10 +576,13 @@ class FusionStrategy:
         risk_amount = balance * (risk_per_trade_pct / 100)
 
         # Position size = risk / (stop_loss_pct / 100)
-        # With leverage, actual position = position * leverage
         notional = risk_amount / (stop_loss_pct / 100)
 
-        # Cap at max position size from config
+        # Cap at max position size (50% of balance for scalping)
+        max_notional = balance * 0.5
+        notional = min(notional, max_notional)
+
+        # Cap at symbol-specific max
         symbol_config = self.settings.symbol_configs.get("BTCUSDT")  # Default
         if symbol_config:
             notional = min(notional, symbol_config.max_position_size_usd)
@@ -395,3 +591,35 @@ class FusionStrategy:
         quantity = notional / current_price
 
         return quantity
+
+    def get_fusion_summary(self, decision: FusionDecision) -> str:
+        """
+        Get a human-readable summary of the fusion decision.
+
+        Returns:
+            Summary string for logging/display
+        """
+        parts = [
+            f"[{decision.symbol}]",
+            f"Action: {decision.action.value}",
+            f"Score: {decision.final_score:.3f}",
+            f"Conf: {decision.confidence:.2f}",
+        ]
+
+        if decision.override_reason:
+            parts.append(f"Override: {decision.override_reason}")
+
+        if decision.action != TradingAction.FLAT:
+            parts.extend([
+                f"Lev: {decision.leverage}x",
+                f"SL: {decision.stop_loss_pct:.2f}%",
+                f"TP: {decision.take_profit_pct:.2f}%",
+            ])
+
+        if decision.trailing_stop_active:
+            parts.append("Trailing: ON")
+
+        if decision.recommended_defensive_action:
+            parts.append(f"Defense: {decision.recommended_defensive_action.value}")
+
+        return " | ".join(parts)
