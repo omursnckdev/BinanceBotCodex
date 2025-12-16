@@ -1,6 +1,11 @@
 """
-Order execution module.
+Order execution module (v3).
 Handles order placement, bracket orders, and defensive actions.
+
+v3 Features:
+- Trailing stop integration
+- ATR-bounded stop loss calculation
+- Graduated time-stop support
 
 IMPORTANT:
 - SL/TP computed from actual fill price, not ticker
@@ -45,7 +50,7 @@ class ExecutionResult:
 
 class OrderExecutor:
     """
-    Order executor with safety controls.
+    Order executor with safety controls (v3).
 
     Features:
     - Dry-run mode support
@@ -53,6 +58,11 @@ class OrderExecutor:
     - Defensive action execution
     - Fill price based SL/TP calculation
     - Idempotency handling
+
+    v3 Features:
+    - Trailing stop initialization and updates
+    - ATR-bounded stop loss calculation
+    - Graduated time-stop integration
     """
 
     def __init__(
@@ -748,6 +758,154 @@ class OrderExecutor:
                 if symbol not in exchange_symbols:
                     logger.warning(f"Position in state not on exchange: {symbol}")
                     self.state.clear_position(symbol)
+                    # v3: Reset trailing stop for closed position
+                    self.risk_manager.reset_trailing_stop(symbol)
 
         except Exception as e:
             logger.error(f"Position sync failed: {e}")
+
+    # ==================== v3 FEATURES ====================
+
+    def update_trailing_stop(
+        self,
+        symbol: str,
+        current_price: float,
+    ) -> ExecutionResult:
+        """
+        Update trailing stop for a position (v3).
+
+        Called by main loop to update trailing stops based on price movement.
+
+        Args:
+            symbol: Trading pair
+            current_price: Current market price
+
+        Returns:
+            ExecutionResult indicating if stop was updated
+        """
+        position = self.state.get_position(symbol)
+        if not position:
+            return ExecutionResult(
+                success=False,
+                message=f"No position for trailing stop update: {symbol}"
+            )
+
+        # Check if trailing stop should be updated
+        should_update, new_stop, reason = self.risk_manager.update_trailing_stop(
+            symbol, current_price
+        )
+
+        if not should_update:
+            return ExecutionResult(success=True, message="No trailing update needed")
+
+        # Round to valid price
+        symbol_info = self.client.get_symbol_info(symbol)
+        if symbol_info:
+            new_stop = float(symbol_info.round_price(new_stop))
+
+        if not self._is_live_trading():
+            self._log_dry_run(
+                "Trailing stop update",
+                symbol=symbol,
+                old_stop=position.stop_loss_price,
+                new_stop=new_stop,
+                reason=reason,
+            )
+            return ExecutionResult(
+                success=True,
+                message=f"[DRY-RUN] Trailing stop updated: {reason}"
+            )
+
+        try:
+            # Cancel old SL
+            if position.stop_loss_order_id:
+                self.client.cancel_order(symbol, position.stop_loss_order_id)
+
+            # Place new SL
+            sl_side = "SELL" if position.side == "LONG" else "BUY"
+            result = self.client.place_stop_loss_order(
+                symbol=symbol,
+                side=sl_side,
+                quantity=position.quantity,
+                stop_price=new_stop,
+                reduce_only=True,
+                client_order_id=self._generate_client_order_id("TRAIL"),
+            )
+
+            # Update state
+            self.state.update_stop_loss_order(symbol, result.order_id, new_stop)
+
+            logger.info(
+                f"Trailing stop updated",
+                extra={
+                    "symbol": symbol,
+                    "old_stop": position.stop_loss_price,
+                    "new_stop": new_stop,
+                    "reason": reason,
+                }
+            )
+
+            return ExecutionResult(
+                success=True,
+                message=f"Trailing stop updated: {reason}",
+                sl_order_id=result.order_id,
+            )
+
+        except Exception as e:
+            logger.error(f"Trailing stop update failed: {e}", extra={"symbol": symbol})
+            # Try to re-place original stop
+            self._replace_stop_loss(symbol, position)
+            return ExecutionResult(
+                success=False,
+                message=f"Trailing update failed: {e}"
+            )
+
+    def initialize_trailing_stop(
+        self,
+        symbol: str,
+        entry_price: float,
+        side: str,
+        initial_stop: float,
+    ) -> None:
+        """
+        Initialize trailing stop tracking for a new position (v3).
+
+        Called after entry to start trailing stop tracking.
+
+        Args:
+            symbol: Trading pair
+            entry_price: Actual fill price
+            side: 'LONG' or 'SHORT'
+            initial_stop: Initial stop loss price
+        """
+        self.risk_manager.initialize_trailing_stop(
+            symbol=symbol,
+            entry_price=entry_price,
+            side=side,
+            initial_stop=initial_stop,
+        )
+
+    def check_time_stop(
+        self,
+        symbol: str,
+        current_pnl_pct: float,
+    ) -> Tuple[bool, str]:
+        """
+        Check if position should be closed due to time stop (v3).
+
+        Args:
+            symbol: Trading pair
+            current_pnl_pct: Current PnL percentage
+
+        Returns:
+            Tuple of (should_close, reason)
+        """
+        position = self.state.get_position(symbol)
+        if not position:
+            return False, ""
+
+        position_age_minutes = (
+            datetime.utcnow() - position.opened_at
+        ).total_seconds() / 60
+
+        return self.risk_manager.check_time_stop(position_age_minutes, current_pnl_pct)
